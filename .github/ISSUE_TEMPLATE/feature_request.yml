@@ -1,0 +1,50 @@
+name: Feature request
+description: Suggest an improvement with a clear use case and acceptance criteria.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the use case and expected behavior. Read the [architecture contract](https://github.com/sirdont0/solana-yellowstone-grpc-data-core/blob/main/docs/ARCHITECTURE.md) before proposing guarantees about canonical state.
+  - type: textarea
+    id: usecase
+    attributes:
+      label: Problem or use case
+      description: What is currently difficult or missing?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe a testable result, not only an implementation idea.
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Suggested area
+      options:
+        - Core transport / source lifecycle
+        - WAL / replay / recovery
+        - Transaction and CPI API
+        - Handler example / integration
+        - Observability / performance
+        - Documentation / developer experience
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria and evidence
+      description: How would we verify this is implemented correctly?
+    validations:
+      required: true
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Constraints and trade-offs
+      description: Include compatibility, latency, provider restrictions or data-quality limitations if relevant.

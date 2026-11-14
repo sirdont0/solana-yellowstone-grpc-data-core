@@ -1,0 +1,11 @@
+{
+  "source_count": 1,
+  "commitment": "finalized",
+  "delivery": "provisional",
+  "filter_version": "pumpfun-create-v1",
+  "data_dir": "./run",
+  "queue_capacity": 4096,
+  "dedupe_limit": 2000000,
+  "ping_interval_seconds": 15,
+  "idle_timeout_seconds": 45
+}

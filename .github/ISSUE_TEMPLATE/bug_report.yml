@@ -1,0 +1,78 @@
+name: Bug report
+description: Report a reproducible defect in the Yellowstone Core.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a defect. Do not include tokens, private keys or sensitive raw WAL data.
+        For exploitable vulnerabilities, follow [SECURITY.md](https://github.com/sirdont0/solana-yellowstone-grpc-data-core/blob/main/SECURITY.md) and report privately.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and impact.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Use a minimal example or sanitized fixture where possible.
+      placeholder: |
+        1. Configure ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Yellowstone transport / reconnect
+        - WAL / durability / replay
+        - Transaction / ALT / CPI decoding
+        - Deduplication / quality
+        - Example handler or CLI
+        - Configuration / documentation
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Core commit and Go version
+      placeholder: "commit SHA; go version go1.26.x"
+    validations:
+      required: true
+  - type: dropdown
+    id: delivery
+    attributes:
+      label: Delivery mode
+      options:
+        - Provisional
+        - Durable
+        - Offline replay
+        - Not applicable / unknown
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized logs or fixtures
+      description: Include only redacted evidence. Never attach production WALs with sensitive data.
+      render: shell
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I removed credentials and sensitive data from this report.
+          required: true

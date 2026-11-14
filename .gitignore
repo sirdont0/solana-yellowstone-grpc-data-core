@@ -1,0 +1,15 @@
+.DS_Store
+/.env
+/.env.*
+!/.env.example
+/.envrc
+/config.json
+/secrets/
+*.pem
+*.key
+/run/
+/tmp/
+/data/
+*.wal
+*.log
+*.test
