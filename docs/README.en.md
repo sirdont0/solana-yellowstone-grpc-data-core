@@ -63,10 +63,12 @@ The environment also accepts the legacy CORE_ENDPOINT/CORE_TOKEN and CORE_ENDPOI
 
 Import the module directly in your Go application. The engine invokes handlers and your sink **in-process**, without another gRPC hop between Core and the consuming application.
 
-The repository is public. Pin the published experimental release for a
-reproducible dependency; no `GOPRIVATE` override is needed:
+The repository is public. `v0.1.0` lacks subsequent WAL repairs. Until the
+prepared `v0.1.1` tag is published, the immutable public hardening baseline below
+is safer than that old tag; it does not include the additional audit-branch fixes.
+No `GOPRIVATE` override is needed:
 
-    go get github.com/sirdont0/solana-yellowstone-grpc-data-core@v0.1.0
+    go get github.com/sirdont0/solana-yellowstone-grpc-data-core@881448f84d466fe5fa33a9ef0a595fb71713c710
 
 For local development alongside Aggregator V2, use a sibling directory and a
 temporary replace directive instead of depending on a remote branch:
@@ -142,3 +144,27 @@ For contributors:
     go vet ./...
 
 If proto definitions change, run [scripts/regenerate-proto.sh](../scripts/regenerate-proto.sh) and verify coexistence with the existing Aggregator protobuf client. See [architecture and acceptance criteria](ARCHITECTURE.md) and [deferred recovery tasks](TECH_DEBT.md). This project is not an official Solana, Triton One or Pump.fun SDK.
+
+## Error isolation, recovery and evidence
+
+`Config.DecodeErrorPolicy` defaults to `FailClosed`. Choose `SkipAndFlag` to
+retain the raw observation, skip a whole unreadable transaction and latch
+`CONTINUITY_BROKEN`. `RegisterWithPolicy(handler, SkipAndFlag)` applies that
+choice to a handler. Sink/storage failures and conflicting identities are always
+fatal. No partial transaction output is published after a decoder error.
+
+`ReplayWithOptions(ctx, ReplayOptions{TolerantTail:true})` reads a torn WAL's
+valid prefix without modifying it. All sources are preflighted before delivery;
+CRC/identity corruption and active writers remain errors. Metadata presence
+flags are preserved: unrecorded CPI is not known-empty CPI.
+
+Public reconnect controls are `ReplayOverlap` (zero selects 64 slots),
+`MaxReconnects` (zero means unlimited) and optional `FromSlot`.
+CLI JSON exposes `replay_overlap`, `max_reconnects`, `from_slot`,
+`decode_error_policy` / `handler_error_policy` (`fail_closed` or `skip_and_flag`)
+and `tolerant_replay_tail`.
+
+Poll `Health()`, `Diagnostics()` and `Evidence()` for detached snapshots.
+`Source.FailureDomain` is a caller assertion; omitted domains share one
+unspecified group. `Logger` accepts a `*slog.Logger` for redacted transport and
+skip diagnostics. Evidence is bounded and never certifies exact chain coverage.

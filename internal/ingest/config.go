@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -24,6 +27,7 @@ const (
 )
 
 type Config struct {
+	Logger            *slog.Logger `json:"-"`
 	SourceID          string
 	Endpoint          string
 	Token             string `json:"-"`
@@ -112,6 +116,23 @@ func (c Config) Validate() error {
 	}
 	if c.Endpoint == "" || strings.TrimSpace(c.TokenHeader) == "" || c.FilterVersion == "" || c.DataDir == "" {
 		return errors.New("endpoint, token header, filter version and data dir required")
+	}
+	target := c.Endpoint
+	if strings.Contains(target, "://") {
+		u, err := url.Parse(target)
+		if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" || (u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "grpc" && u.Scheme != "grpcs") {
+			return errors.New("endpoint must be host:port with optional grpc(s)/http(s) scheme and no credentials or path")
+		}
+		target = u.Host
+	}
+	if host, port, err := net.SplitHostPort(target); err != nil || host == "" || port == "" {
+		return errors.New("endpoint must include host and port")
+	}
+	if !regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`).MatchString(c.TokenHeader) || strings.HasSuffix(strings.ToLower(c.TokenHeader), "-bin") || strings.HasPrefix(strings.ToLower(c.TokenHeader), "grpc-") {
+		return errors.New("invalid token header")
+	}
+	if strings.ContainsAny(c.Token, "\r\n") {
+		return errors.New("invalid token characters")
 	}
 	if c.Token != "" && (strings.HasPrefix(strings.ToLower(c.Endpoint), "grpc://") || strings.HasPrefix(strings.ToLower(c.Endpoint), "http://")) {
 		return errors.New("provider token requires TLS; plaintext gRPC endpoint is forbidden")

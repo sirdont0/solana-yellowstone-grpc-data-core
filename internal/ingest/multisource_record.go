@@ -39,7 +39,7 @@ func (c *MultiSourceCoordinator) ObserveRecord(r Record) (MultiSourceDecision, e
 		o.Kind = MultiSourceConnect
 	case "disconnect", "session_end":
 		o.Kind = MultiSourceDisconnect
-	case "continuity_broken", "replay_retention_exceeded", "replay_rejected", "dedupe_limit", "checkpoint_write_failed", "filter_identity_changed":
+	case "continuity_broken", "replay_retention_exceeded", "replay_rejected", "dedupe_limit", "checkpoint_write_failed", "filter_identity_changed", "unreadable_update", "handler_error", "evidence_error":
 		o.Kind = MultiSourceFailure
 	case "dedupe_conflict":
 		o.Kind = MultiSourceConflictSignal
@@ -83,7 +83,7 @@ func (c *MultiSourceCoordinator) ObserveWALRecord(walSource string, r Record) (M
 			s.pendingAttempt = false
 			result.Processed = true
 		}
-	case "continuity_broken", "filter_identity_changed", "checkpoint_write_failed", "replay_retention_exceeded", "replay_rejected", "dedupe_limit":
+	case "continuity_broken", "filter_identity_changed", "checkpoint_write_failed", "replay_retention_exceeded", "replay_rejected", "dedupe_limit", "unreadable_update", "handler_error", "evidence_error":
 		c.breakSource(s, &result, "wal_"+r.Kind, r.Slot, r.Detail)
 		result.Processed = true
 	case "dedupe_conflict":

@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +16,7 @@ import (
 	pb "github.com/sirdont0/solana-yellowstone-grpc-data-core/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
@@ -51,7 +52,21 @@ func GRPCDial(ctx context.Context, c Config) (*grpc.ClientConn, error) {
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	return grpc.DialContext(dialCtx, target, grpc.WithBlock(), grpc.WithTransportCredentials(cred), grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 20 * time.Second, Timeout: 10 * time.Second, PermitWithoutStream: true}), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(c.MaxMessageBytes)))
+	conn, err := grpc.NewClient("passthrough:///"+target, grpc.WithTransportCredentials(cred), grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 20 * time.Second, Timeout: 10 * time.Second, PermitWithoutStream: true}), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(c.MaxMessageBytes)))
+	if err != nil {
+		return nil, err
+	}
+	conn.Connect()
+	for {
+		state := conn.GetState()
+		if state == connectivity.Ready {
+			return conn, nil
+		}
+		if !conn.WaitForStateChange(dialCtx, state) {
+			conn.Close()
+			return nil, dialCtx.Err()
+		}
+	}
 }
 
 func auth(ctx context.Context, c Config) context.Context {
@@ -133,8 +148,10 @@ func (r *Runner) runSource(ctx context.Context, source string) error {
 		}
 		var from *uint64
 		if !disableReplay {
-			if st != nil && st.LastSlot > 0 {
-				v := st.LastSlot
+			if st != nil && st.LastTxSlot > 0 {
+				// Unfiltered slot/meta progress can run ahead of filtered transactions.
+				// It is not a safe transaction replay cursor.
+				v := st.LastTxSlot
 				if v > r.Config.ReplayOverlap {
 					v -= r.Config.ReplayOverlap
 				} else {
@@ -142,7 +159,7 @@ func (r *Runner) runSource(ctx context.Context, source string) error {
 				}
 				from = &v
 			}
-			if st == nil && r.Config.FromSlot != nil {
+			if (st == nil || st.LastTxSlot == 0) && r.Config.FromSlot != nil {
 				v := *r.Config.FromSlot
 				from = &v
 			}
@@ -173,7 +190,9 @@ func (r *Runner) runSource(ctx context.Context, source string) error {
 		if errors.Is(err, errDurableWriterFailed) {
 			return err // Storage/integrity failure is terminal; reconnect cannot fix it.
 		}
-		fmt.Fprintf(os.Stderr, "stream=%s generation=%d disconnect=%s\n", source, gen, sanitizeErr(err, r.Config.Token))
+		if r.Config.Logger != nil {
+			r.Config.Logger.Warn("source disconnected", "source", source, "generation", gen, "error", sanitizeErr(err, r.Config.Token))
+		}
 		if from != nil && isReplayRejection(err) {
 			disableReplay = true
 			if e := r.Store.Mark(source, gen, "replay_rejected", "provider rejected from_slot; next reconnect starts at live head"); e != nil {
@@ -184,9 +203,9 @@ func (r *Runner) runSource(ctx context.Context, source string) error {
 		}
 		reconnects++
 		if r.Config.MaxReconnects > 0 && reconnects >= r.Config.MaxReconnects {
-			return fmt.Errorf("stream %s max reconnects reached: %w", source, err)
+			return fmt.Errorf("stream %s max reconnects reached: %s", source, sanitizeErr(err, r.Config.Token))
 		}
-		wait := time.Duration(1<<min(reconnects-1, 4)) * 250 * time.Millisecond
+		wait := reconnectDelay(reconnects)
 		select {
 		case <-ctx.Done():
 			return nil
@@ -284,8 +303,9 @@ func (r *Runner) runOnce(parent context.Context, source string, gen uint64, from
 		}
 		lastRecv.Store(time.Now().UnixNano())
 		if u.GetPing() != nil {
-			// Server initiated application ping: acknowledge on the same stream.
-			if e = send(&pb.SubscribeRequest{Ping: &pb.SubscribeRequestPing{Id: 1}}); e != nil {
+			// SubscribeUpdatePing has no ID. Allocate a client request ID; the
+			// server echoes that ID in SubscribeUpdatePong.
+			if e = send(&pb.SubscribeRequest{Ping: &pb.SubscribeRequestPing{Id: pingSeq.Add(1)}}); e != nil {
 				return e
 			}
 		}
@@ -310,6 +330,13 @@ func (r *Runner) runOnce(parent context.Context, source string, gen uint64, from
 		}
 	}
 }
+
+// Full bounded jitter avoids synchronized retries across clients.
+func reconnectDelay(attempt int) time.Duration {
+	base := time.Duration(1<<min(max(attempt-1, 0), 4)) * 250 * time.Millisecond
+	return base/2 + time.Duration(rand.Int64N(int64(base/2)+1))
+}
+
 func fromString(v *uint64) string {
 	if v == nil {
 		return "none"
@@ -320,7 +347,7 @@ func sanitizeErr(err error, secrets ...string) string {
 	if err == nil {
 		return "none"
 	}
-	message := strings.ReplaceAll(err.Error(), "\n", " ")
+	message := strings.NewReplacer("\n", " ", "\r", " ").Replace(err.Error())
 	for _, secret := range secrets {
 		if secret != "" {
 			message = strings.ReplaceAll(message, secret, "[REDACTED]")

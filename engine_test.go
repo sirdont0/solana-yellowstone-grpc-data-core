@@ -117,7 +117,7 @@ func TestDispatchCrossSourceDedupeAndStickyQuality(t *testing.T) {
 	}
 	raw, _ := proto.Marshal(makeUpdate(123, false))
 	sig := base58.Encode(makeUpdate(123, false).GetTransaction().GetTransaction().GetSignature())
-	rec := lab.Record{Kind: "transaction", Raw: raw, Source: "a", Commitment: "finalized", FilterVersion: "sample-1", Slot: 123, BankID: 5, TxIndex: 2, Signature: sig, Digest: "same"}
+	rec := lab.Record{Kind: "transaction", Raw: raw, Source: "a", Commitment: "finalized", FilterVersion: "sample-1", Slot: 123, BankID: 5, TxIndex: 2, Signature: sig, Digest: testDigest(t, raw)}
 	if err := engine.dispatch(context.Background(), input{rec: rec}); err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestDispatchCrossSourceDedupeAndStickyQuality(t *testing.T) {
 	rec.Raw = raw2
 	rec.Slot = 124
 	rec.Signature = base58.Encode(makeUpdate(124, false).GetTransaction().GetTransaction().GetSignature())
-	rec.Digest = "next"
+	rec.Digest = testDigest(t, raw2)
 	if err := engine.dispatch(context.Background(), input{rec: rec}); err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestDispatchCrossSourceDedupeAndStickyQuality(t *testing.T) {
 	rec.Raw = failedRaw
 	rec.Slot = 125
 	rec.Signature = base58.Encode(makeUpdate(125, true).GetTransaction().GetTransaction().GetSignature())
-	rec.Digest = "failed"
+	rec.Digest = testDigest(t, failedRaw)
 	if err := engine.dispatch(context.Background(), input{rec: rec}); err != nil {
 		t.Fatal(err)
 	}
@@ -182,8 +182,8 @@ func TestDispatchEmissionIDsAreUniqueAcrossHandlers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := lab.Record{Kind: "transaction", Raw: raw, Source: "a", Commitment: "finalized", FilterVersion: "sample-1", Slot: 123, TxIndex: 2,
-		Signature: base58.Encode(update.GetTransaction().GetTransaction().GetSignature()), Digest: "same"}
+	rec := lab.Record{Kind: "transaction", Raw: raw, Source: "a", Commitment: "finalized", FilterVersion: "sample-1", Slot: 123, BankID: 5, TxIndex: 2,
+		Signature: base58.Encode(update.GetTransaction().GetTransaction().GetSignature()), Digest: testDigest(t, raw)}
 	if err := engine.dispatch(context.Background(), input{rec: rec}); err != nil {
 		t.Fatal(err)
 	}
@@ -216,8 +216,8 @@ func TestDispatchDecoderFailureDoesNotPublishPartialTransaction(t *testing.T) {
 	}
 	update := makeUpdate(123, false)
 	raw, _ := proto.Marshal(update)
-	rec := lab.Record{Kind: "transaction", Raw: raw, Source: "a", Commitment: "finalized", FilterVersion: "sample-1", Slot: 123, TxIndex: 2,
-		Signature: base58.Encode(update.GetTransaction().GetTransaction().GetSignature()), Digest: "same"}
+	rec := lab.Record{Kind: "transaction", Raw: raw, Source: "a", Commitment: "finalized", FilterVersion: "sample-1", Slot: 123, BankID: 5, TxIndex: 2,
+		Signature: base58.Encode(update.GetTransaction().GetTransaction().GetSignature()), Digest: testDigest(t, raw)}
 	if err := engine.dispatch(context.Background(), input{rec: rec}); err == nil {
 		t.Fatal("expected decoder error")
 	}
@@ -243,8 +243,8 @@ func TestDispatchSinkErrorDoesNotMarkTransactionDelivered(t *testing.T) {
 	}
 	update := makeUpdate(123, false)
 	raw, _ := proto.Marshal(update)
-	rec := lab.Record{Kind: "transaction", Raw: raw, Source: "a", Commitment: "finalized", FilterVersion: "sample-1", Slot: 123, TxIndex: 2,
-		Signature: base58.Encode(update.GetTransaction().GetTransaction().GetSignature()), Digest: "same"}
+	rec := lab.Record{Kind: "transaction", Raw: raw, Source: "a", Commitment: "finalized", FilterVersion: "sample-1", Slot: 123, BankID: 5, TxIndex: 2,
+		Signature: base58.Encode(update.GetTransaction().GetTransaction().GetSignature()), Digest: testDigest(t, raw)}
 	if err := engine.dispatch(context.Background(), input{rec: rec}); err == nil {
 		t.Fatal("expected sink error")
 	}
@@ -324,4 +324,17 @@ func TestReplayRejectsRecordFromAnotherSource(t *testing.T) {
 	if err := engine.Replay(context.Background()); err == nil || !strings.Contains(err.Error(), "WAL source mismatch") {
 		t.Fatalf("expected replay source validation failure, got %v", err)
 	}
+}
+
+func testDigest(t *testing.T, raw []byte) string {
+	t.Helper()
+	var u pb.SubscribeUpdate
+	if err := proto.Unmarshal(raw, &u); err != nil {
+		t.Fatal(err)
+	}
+	r, err := lab.FromUpdate(lab.Config{}, "a", 1, &u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r.Digest
 }

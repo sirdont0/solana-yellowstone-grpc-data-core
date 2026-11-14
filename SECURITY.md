@@ -15,7 +15,7 @@ There is no production-security or response-time SLA. The project has not yet pa
 
 **Do not disclose a security issue, provider credential or exploit in a regular GitHub Issue or PR.**
 
-Use GitHub's **private vulnerability reporting / security advisory** workflow for this repository if it is enabled, or contact the maintainer through an existing private channel. Include a concise impact description, affected commit/version, minimal reproduction and any suggested mitigation. Share sensitive fixtures privately and only when necessary.
+Use [GitHub private vulnerability reporting](https://github.com/sirdont0/solana-yellowstone-grpc-data-core/security/advisories/new), enabled for this repository and verified on 2026-11-15. Include a concise impact description, affected commit/version, minimal reproduction and any suggested mitigation. Share sensitive fixtures privately and only when necessary.
 
 For ordinary non-sensitive correctness bugs, use the [bug report form](https://github.com/sirdont0/solana-yellowstone-grpc-data-core/issues/new?template=bug_report.yml).
 

@@ -22,6 +22,7 @@ type WAL struct {
 	f             *os.File
 	records       uint64
 	RecoveredTail bool
+	failure       error
 }
 
 // OpenWAL refuses concurrent writers and detects fully written corrupt records.
@@ -53,6 +54,17 @@ func OpenWAL(path string, visit func(Record) error) (*WAL, error) {
 		if err = f.Sync(); err != nil {
 			w.Close()
 			return nil, err
+		}
+		dir, e := os.Open(filepath.Dir(path))
+		if e != nil {
+			w.Close()
+			return nil, e
+		}
+		e = dir.Sync()
+		_ = dir.Close()
+		if e != nil {
+			w.Close()
+			return nil, e
 		}
 		return w, nil
 	}
@@ -91,6 +103,10 @@ func OpenWAL(path string, visit func(Record) error) (*WAL, error) {
 		if length == 0 || length > maxFrame {
 			w.Close()
 			return nil, fmt.Errorf("invalid WAL frame at %d size=%d", good, length)
+		}
+		if int64(length) > size-good-8 {
+			w.RecoveredTail = true
+			break
 		}
 		body := make([]byte, length)
 		_, e = io.ReadFull(f, body)
@@ -144,12 +160,23 @@ func (w *WAL) Append(r Record) error {
 // AppendBatch preserves input order and performs one fsync for the batch.
 // A failed write/sync is fatal to the owning stream; callers must not claim
 // durability for any record in a failed batch.
-func (w *WAL) AppendBatch(records []Record) error {
+func (w *WAL) AppendBatch(records []Record) (err error) {
 	if len(records) == 0 {
 		return nil
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.f == nil {
+		return errors.New("WAL closed")
+	}
+	if w.failure != nil {
+		return w.failure
+	}
+	defer func() {
+		if err != nil {
+			w.failure = err
+		}
+	}()
 	for _, r := range records {
 		b, e := json.Marshal(r)
 		if e != nil {
@@ -176,58 +203,111 @@ func (w *WAL) AppendBatch(records []Record) error {
 }
 func (w *WAL) Count() uint64 { w.mu.Lock(); defer w.mu.Unlock(); return w.records }
 func (w *WAL) Close() error {
-	if w == nil || w.f == nil {
+	if w == nil {
 		return nil
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	_ = syscall.Flock(int(w.f.Fd()), syscall.LOCK_UN)
-	e := w.f.Close()
+	if w.f == nil {
+		return nil
+	}
+	// Closing the descriptor releases the lock; never unlock before close.
+	err := w.f.Close()
 	w.f = nil
-	return e
+	return err
 }
 
-func ReadWAL(path string, visit func(Record) error) error {
-	f, e := os.Open(path)
-	if e != nil {
-		return e
+// WALReader holds a nonblocking shared lock for preflight and replay. A live
+// writer is rejected instead of racing an append or tail repair.
+type WALReader struct{ f *os.File }
+type WALReadReport struct {
+	TruncatedTail bool
+	ValidBytes    int64
+	Records       uint64
+}
+
+func OpenWALReader(path string) (*WALReader, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
-	defer f.Close()
+	if err = syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("WAL has an active writer: %w", err)
+	}
+	return &WALReader{f}, nil
+}
+func (r *WALReader) Close() error { return r.f.Close() }
+
+func ReadWAL(path string, visit func(Record) error) error {
+	r, err := OpenWALReader(path)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	_, err = r.Read(false, visit)
+	return err
+}
+
+// Read verifies the entire immutable prefix. Tolerant mode ignores only an
+// incomplete final frame, never a bad header, invalid length, JSON or CRC.
+func (r *WALReader) Read(tolerant bool, visit func(Record) error) (report WALReadReport, err error) {
+	f := r.f
+	if _, err = f.Seek(0, io.SeekStart); err != nil {
+		return
+	}
+	stat, err := f.Stat()
+	if err != nil {
+		return report, err
+	}
 	header := make([]byte, len(walMagic))
-	if _, e = io.ReadFull(f, header); e != nil {
-		return e
+	if _, err = io.ReadFull(f, header); err != nil {
+		return
 	}
 	if string(header) != string(walMagic) {
-		return errors.New("wrong WAL format")
+		return report, errors.New("wrong WAL format")
 	}
-	offset := int64(len(walMagic))
+	report.ValidBytes = int64(len(walMagic))
+	tail := func(e error) (WALReadReport, error) {
+		if tolerant && (errors.Is(e, io.EOF) || errors.Is(e, io.ErrUnexpectedEOF)) {
+			report.TruncatedTail = true
+			return report, nil
+		}
+		return report, fmt.Errorf("WAL truncated at %d: %w", report.ValidBytes, e)
+	}
 	for {
 		var frame [8]byte
-		_, e = io.ReadFull(f, frame[:])
-		if errors.Is(e, io.EOF) {
-			return nil
+		_, err = io.ReadFull(f, frame[:])
+		if errors.Is(err, io.EOF) {
+			return report, nil
 		}
-		if e != nil {
-			return fmt.Errorf("WAL truncated at %d: %w", offset, e)
+		if err != nil {
+			return tail(err)
 		}
 		length := binary.LittleEndian.Uint32(frame[:4])
 		if length == 0 || length > maxFrame {
-			return fmt.Errorf("invalid WAL frame at %d", offset)
+			return report, fmt.Errorf("invalid WAL frame at %d", report.ValidBytes)
+		}
+		if int64(length) > stat.Size()-report.ValidBytes-8 {
+			return tail(io.ErrUnexpectedEOF)
 		}
 		body := make([]byte, length)
-		if _, e = io.ReadFull(f, body); e != nil {
-			return fmt.Errorf("WAL truncated at %d: %w", offset, e)
+		if _, err = io.ReadFull(f, body); err != nil {
+			return tail(err)
 		}
 		if crc32.ChecksumIEEE(body) != binary.LittleEndian.Uint32(frame[4:]) {
-			return fmt.Errorf("WAL CRC at %d", offset)
+			return report, fmt.Errorf("WAL CRC at %d", report.ValidBytes)
 		}
 		var rec Record
-		if e = json.Unmarshal(body, &rec); e != nil {
-			return e
+		if err = json.Unmarshal(body, &rec); err != nil {
+			return report, err
 		}
-		if e = visit(rec); e != nil {
-			return e
+		if visit != nil {
+			if err = visit(rec); err != nil {
+				return report, err
+			}
 		}
-		offset += 8 + int64(length)
+		report.ValidBytes += 8 + int64(length)
+		report.Records++
 	}
 }

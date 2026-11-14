@@ -63,10 +63,12 @@ Go не читает .env автоматически: переменные ну�
 
 Библиотека импортируется в Go-приложение; обработчики и sink вызываются **в том же процессе**, без дополнительного gRPC между ядром и агрегатором.
 
-Репозиторий публичный. Для воспроизводимой зависимости используй
-опубликованный экспериментальный релиз; `GOPRIVATE` не требуется:
+Репозиторий публичный. В `v0.1.0` нет последующих WAL-исправлений. Пока
+подготовленный `v0.1.1` не опубликован, ниже указан неизменяемый публичный
+коммит с WAL-hardening. Дополнительные исправления ветки аудита в него ещё
+не входят. `GOPRIVATE` не требуется:
 
-    go get github.com/sirdont0/solana-yellowstone-grpc-data-core@v0.1.0
+    go get github.com/sirdont0/solana-yellowstone-grpc-data-core@881448f84d466fe5fa33a9ef0a595fb71713c710
 
 При локальной разработке рядом с Aggregator V2 можно использовать соседнюю
 папку и временный replace:
@@ -142,3 +144,25 @@ Replay проверяет CRC и вызывает те же обработчик
     go vet ./...
 
 При обновлении proto запускай [scripts/regenerate-proto.sh](../scripts/regenerate-proto.sh) и проверяй совместное подключение со старым protobuf-клиентом агрегатора. Подробности — в [архитектурном контракте](ARCHITECTURE.md) и [техдолге](TECH_DEBT.md). Это независимый проект, не официальный SDK Solana, Triton One или Pump.fun.
+
+## Ошибки, восстановление и диагностика
+
+`Config.DecodeErrorPolicy` по умолчанию равен `FailClosed`. Явный `SkipAndFlag`
+пропускает целую нечитаемую транзакцию, сохраняет raw и диагностический маркер,
+фиксирует `CONTINUITY_BROKEN`. Для обработчика доступен
+`RegisterWithPolicy(handler, SkipAndFlag)`. Ошибки sink/storage и конфликты
+целостности всегда фатальны. Частичные эффекты после ошибки декодера не выходят.
+
+`ReplayWithOptions(ctx, ReplayOptions{TolerantTail:true})` читает целый префикс
+оборванного WAL без изменения файла. До выдачи событий проверяются все журналы;
+неверные CRC/identity и активный writer остаются ошибками. Отсутствие записи CPI
+не равно известному пустому списку CPI.
+
+Настройки API: `ReplayOverlap` (0 выбирает 64 слота), `MaxReconnects` (0 — без
+лимита), `FromSlot`. В JSON примера: `replay_overlap`, `max_reconnects`,
+`from_slot`, `decode_error_policy`, `handler_error_policy` (значения
+`fail_closed` / `skip_and_flag`) и `tolerant_replay_tail`.
+
+`Health()`, `Diagnostics()` и `Evidence()` возвращают независимые снимки.
+`Source.FailureDomain` задаётся приложением; неизвестные домены считаются одним.
+`Logger` принимает `*slog.Logger`. Диагностика не доказывает полноту банков.

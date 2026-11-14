@@ -63,6 +63,7 @@ func FromUpdate(c Config, source string, generation uint64, u *pb.SubscribeUpdat
 	case u.GetTransactionStatus() != nil:
 		t := u.GetTransactionStatus()
 		r.Kind = "transaction_status"
+		r.BankID = t.GetBankId()
 		r.Slot = t.GetSlot()
 		r.Signature = base58.Encode(t.GetSignature())
 		r.TxIndex = t.GetIndex()
@@ -96,6 +97,7 @@ func FromUpdate(c Config, source string, generation uint64, u *pb.SubscribeUpdat
 	case u.GetBlockFooter() != nil:
 		f := u.GetBlockFooter()
 		r.Kind = "block_footer"
+		r.BankID = f.GetBankId()
 		r.Slot = f.GetSlot()
 		identityBody = f
 	case u.GetPing() != nil:

@@ -72,13 +72,15 @@ func TestStoreCleanCloseRestartRestoresWALWithoutBreak(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
 	cp := s.Snapshot()
 	if cp.ContinuityBroken || cp.Quality != "OBSERVING_UNVERIFIED" || cp.Sources["A"].Received != 1 || cp.Sources["A"].LastTxSlot != 202 {
 		t.Fatalf("clean restart falsely flagged a gap or lost WAL state: %+v", cp)
 	}
 	if cp.TxInclusionVerifiedThrough != 0 || cp.AccountHistoryVerifiedThrough != 0 {
 		t.Fatal("clean restart must not prove exact coverage")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
 	}
 	var records []Record
 	if err := ReadWAL(filepath.Join(c.DataDir, "journal.wal"), func(r Record) error {

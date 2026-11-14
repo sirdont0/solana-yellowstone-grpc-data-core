@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -31,6 +32,7 @@ const (
 
 type Source struct {
 	ID            string
+	FailureDomain string // Empty means unspecified; never inferred as independent.
 	Endpoint      string
 	Token         string `json:"-"` // must be supplied from environment/secret manager
 	TokenHeader   string
@@ -48,6 +50,27 @@ type Config struct {
 	PingInterval  time.Duration
 	IdleTimeout   time.Duration
 	MaxMessageMiB int
+	// Zero overlap selects 64 slots. Reconnect never proves completeness.
+	ReplayOverlap     uint64
+	MaxReconnects     int // Zero retries indefinitely.
+	FromSlot          *uint64
+	DecodeErrorPolicy ErrorPolicy  // FailClosed by default.
+	Logger            *slog.Logger // Optional structured, credential-redacted transport logs.
+	EvidenceBankLimit int          // Zero selects 256 banks per source.
+}
+
+// ErrorPolicy governs decode failures. Storage, identity conflicts and sink
+// failures always stop the engine; SkipAndFlag discards the WHOLE transaction.
+type ErrorPolicy uint8
+
+const (
+	FailClosed ErrorPolicy = iota
+	SkipAndFlag
+)
+
+type registeredHandler struct {
+	handler Handler
+	policy  ErrorPolicy
 }
 
 type Emission struct {
@@ -89,16 +112,21 @@ type Sink func(context.Context, Event) error
 // Engine has one bounded in-process event queue and one ordered dispatch loop.
 // Its output has receive order only, not proven canonical bank order.
 type Engine struct {
-	cfg       Config
-	sink      Sink
-	handlers  map[string][]Handler
-	mu        sync.Mutex
-	running   atomic.Bool
-	seen      map[string]string
-	healthMu  sync.RWMutex
-	stores    map[string]*lab.Store
-	qualityMu sync.RWMutex
-	broken    map[string]bool
+	cfg         Config
+	sink        Sink
+	handlers    map[string][]registeredHandler
+	mu          sync.Mutex
+	running     atomic.Bool
+	seen        map[string]string
+	healthMu    sync.RWMutex
+	stores      map[string]*lab.Store
+	qualityMu   sync.RWMutex
+	broken      map[string]bool
+	evidence    *lab.MultiSourceCoordinator
+	diagnostics []Diagnostic
+	failures    map[string]uint64
+	queueMu     sync.RWMutex
+	queue       chan input
 }
 
 func New(cfg Config, sink Sink) (*Engine, error) {
@@ -126,6 +154,30 @@ func New(cfg Config, sink Sink) (*Engine, error) {
 	if cfg.MaxMessageMiB <= 0 {
 		cfg.MaxMessageMiB = 64
 	}
+	if cfg.MaxMessageMiB > 256 {
+		return nil, errors.New("core: MaxMessageMiB must be 1..256")
+	}
+	if cfg.DecodeErrorPolicy > SkipAndFlag {
+		return nil, errors.New("core: invalid decode error policy")
+	}
+	if cfg.ReplayOverlap == 0 {
+		cfg.ReplayOverlap = 64
+	}
+	if cfg.EvidenceBankLimit == 0 {
+		cfg.EvidenceBankLimit = 256
+	}
+	if cfg.EvidenceBankLimit < 1 || cfg.EvidenceBankLimit > 4096 {
+		return nil, errors.New("core: EvidenceBankLimit must be 1..4096")
+	}
+	// Own all mutable configuration so callers cannot race a running engine.
+	cfg.Sources = append([]Source(nil), cfg.Sources...)
+	for i := range cfg.Sources {
+		cfg.Sources[i].Programs = append([]string(nil), cfg.Sources[i].Programs...)
+	}
+	if cfg.FromSlot != nil {
+		v := *cfg.FromSlot
+		cfg.FromSlot = &v
+	}
 	if cfg.Delivery != Provisional && cfg.Delivery != Durable {
 		return nil, errors.New("core: invalid delivery mode")
 	}
@@ -139,7 +191,7 @@ func New(cfg Config, sink Sink) (*Engine, error) {
 			return nil, fmt.Errorf("core: source %s: %w", s.ID, err)
 		}
 	}
-	return &Engine{cfg: cfg, sink: sink, handlers: make(map[string][]Handler), seen: make(map[string]string), stores: make(map[string]*lab.Store), broken: make(map[string]bool)}, nil
+	return &Engine{cfg: cfg, sink: sink, handlers: make(map[string][]registeredHandler), seen: make(map[string]string), stores: make(map[string]*lab.Store), broken: make(map[string]bool), failures: make(map[string]uint64)}, nil
 }
 
 func toLabConfig(cfg Config, s Source) lab.Config {
@@ -161,6 +213,7 @@ func toLabConfig(cfg Config, s Source) lab.Config {
 		Programs: append([]string(nil), s.Programs...),
 		DataDir:  filepath.Join(cfg.DataDir, s.ID),
 		Streams:  1, DedupeLimit: cfg.DedupeLimit,
+		ReplayOverlap: cfg.ReplayOverlap, MaxReconnects: cfg.MaxReconnects, FromSlot: cfg.FromSlot, Logger: cfg.Logger,
 		PingInterval: cfg.PingInterval, IdleTimeout: cfg.IdleTimeout,
 		MaxMessageBytes: cfg.MaxMessageMiB << 20,
 	}
@@ -169,22 +222,70 @@ func toLabConfig(cfg Config, s Source) lab.Config {
 // Register must be called before Run. Handlers remain application-owned;
 // changing one while the engine runs is unsupported.
 func (e *Engine) Register(h Handler) error {
-	if e.running.Load() {
-		return errors.New("core: register after Run")
-	}
-	if h == nil || len(h.ProgramIDs()) == 0 {
-		return errors.New("core: handler must declare program IDs")
-	}
+	return e.RegisterWithPolicy(h, FailClosed)
+}
+
+// RegisterWithPolicy selects explicit isolation for this decoder. A skipped
+// decoder failure discards all effects from its transaction, including effects
+// prepared by other handlers. The raw observation remains available for replay.
+func (e *Engine) RegisterWithPolicy(h Handler, policy ErrorPolicy) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	for _, p := range h.ProgramIDs() {
+	if e.running.Load() {
+		return errors.New("core: register while engine is running")
+	}
+	if h == nil || policy > SkipAndFlag {
+		return errors.New("core: invalid handler or error policy")
+	}
+	ids := append([]string(nil), h.ProgramIDs()...)
+	if len(ids) == 0 {
+		return errors.New("core: handler must declare program IDs")
+	}
+	for _, p := range ids {
 		if p == "" {
 			return errors.New("core: empty program ID")
 		}
 	}
-	for _, p := range h.ProgramIDs() {
-		e.handlers[p] = append(e.handlers[p], h)
+	unique := make(map[string]bool)
+	for _, p := range ids {
+		if !unique[p] {
+			e.handlers[p] = append(e.handlers[p], registeredHandler{h, policy})
+			unique[p] = true
+		}
 	}
+	return nil
+}
+
+func (e *Engine) begin() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.running.CompareAndSwap(false, true) {
+		return errors.New("core: already running")
+	}
+	e.seen = make(map[string]string)
+	e.qualityMu.Lock()
+	e.broken = make(map[string]bool)
+	e.qualityMu.Unlock()
+	specs := make([]lab.MultiSourceSpec, 0, len(e.cfg.Sources))
+	for _, src := range e.cfg.Sources {
+		lc := toLabConfig(e.cfg, src)
+		domain := src.FailureDomain
+		if domain == "" {
+			domain = "unspecified"
+		}
+		specs = append(specs, lab.MultiSourceSpec{ID: src.ID, FailureDomain: domain, Identity: lc.Identity(), Commitment: lc.Commitment, FilterVersion: lc.FilterVersion})
+	}
+	evidence, err := lab.NewMultiSourceCoordinator(specs, e.cfg.EvidenceBankLimit)
+	if err != nil {
+		e.running.Store(false)
+		return err
+	}
+	e.healthMu.Lock()
+	e.stores = make(map[string]*lab.Store)
+	e.evidence = evidence
+	e.diagnostics = nil
+	e.failures = make(map[string]uint64)
+	e.healthMu.Unlock()
 	return nil
 }
 
@@ -196,17 +297,17 @@ type input struct {
 // Run owns transports and WALs for this session. It returns only when the
 // context ends or a fatal source, storage, or decoder error occurs.
 func (e *Engine) Run(parent context.Context) error {
-	if !e.running.CompareAndSwap(false, true) {
-		return errors.New("core: already running")
+	if err := e.begin(); err != nil {
+		return err
 	}
 	defer e.running.Store(false)
-	e.seen = make(map[string]string)
-	e.qualityMu.Lock()
-	e.broken = make(map[string]bool)
-	e.qualityMu.Unlock()
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	in := make(chan input, e.cfg.QueueCapacity)
+	e.queueMu.Lock()
+	e.queue = in
+	e.queueMu.Unlock()
+	defer func() { e.queueMu.Lock(); e.queue = nil; e.queueMu.Unlock() }()
 	errCh := make(chan error, len(e.cfg.Sources))
 	var wg sync.WaitGroup
 	var opened []*lab.Store
@@ -217,7 +318,8 @@ func (e *Engine) Run(parent context.Context) error {
 	var prepared []preparedSource
 	for _, src := range e.cfg.Sources {
 		lc := toLabConfig(e.cfg, src)
-		store, err := lab.OpenStore(lc)
+		sourceID := src.ID
+		store, err := lab.OpenStoreObserved(lc, func(r lab.Record) error { e.observeRecord(sourceID, r); return nil })
 		if err != nil {
 			for _, s := range opened {
 				_ = s.Close()
@@ -234,11 +336,6 @@ func (e *Engine) Run(parent context.Context) error {
 			e.broken[src.ID] = true
 			e.qualityMu.Unlock()
 		}
-		sourceID := src.ID
-		store.SetDurableObserver(func(r lab.Record) error {
-			e.observeQuality(sourceID, r)
-			return nil
-		})
 		e.healthMu.Lock()
 		e.stores[src.ID] = store
 		e.healthMu.Unlock()
@@ -296,9 +393,7 @@ func (e *Engine) Run(parent context.Context) error {
 			first = err
 		}
 	}
-	e.healthMu.Lock()
-	e.stores = make(map[string]*lab.Store)
-	e.healthMu.Unlock()
+
 	if first != nil {
 		return first
 	}
@@ -308,20 +403,21 @@ func (e *Engine) Run(parent context.Context) error {
 func (e *Engine) dispatch(ctx context.Context, item input) error {
 	tx, err := decodeRecord(item.rec, item.durable)
 	if err != nil {
-		return fmt.Errorf("core: %w", err)
+		return e.decodeFailure(item.rec, "unreadable_update", err, e.cfg.DecodeErrorPolicy)
 	}
-	if tx.Failed {
-		return nil
-	}
-	key := fmt.Sprintf("%s:%d:%d:%s", tx.Commitment, tx.Slot, tx.Index, tx.Signature)
+	key := fmt.Sprintf("%s:%d:%d", tx.Commitment, tx.Slot, tx.Index)
 	if old, ok := e.seen[key]; ok {
 		if old != tx.Digest {
-			return fmt.Errorf("core: conflicting providers for transaction %s", key)
+			return e.decodeFailure(item.rec, "dedupe_conflict", fmt.Errorf("conflicting providers for transaction position %s", key), FailClosed)
 		}
 		return nil
 	}
 	if len(e.seen) >= e.cfg.DedupeLimit {
-		return errors.New("core: cross-source dedupe capacity exhausted")
+		return e.decodeFailure(item.rec, "dedupe_limit", errors.New("cross-source dedupe capacity exhausted"), FailClosed)
+	}
+	if tx.Failed {
+		e.seen[key] = tx.Digest
+		return nil
 	}
 	// Decode the whole transaction before publishing any effects. A later
 	// handler error must not leave an earlier handler's effects half-applied.
@@ -333,9 +429,9 @@ func (e *Engine) dispatch(ctx context.Context, item input) error {
 		// Restarting it for each handler would give distinct events the same ID.
 		emissionOrdinal := 0
 		for _, h := range e.handlers[ix.ProgramID] {
-			output, err := h.Decode(tx, ix)
+			output, err := h.handler.Decode(tx, ix)
 			if err != nil {
-				return fmt.Errorf("core: handler %s at %s outer=%d inner=%d: %w", ix.ProgramID, tx.Signature, ix.Outer, ix.Inner, err)
+				return e.decodeFailure(item.rec, "handler_error", fmt.Errorf("handler %s outer=%d inner=%d: %w", ix.ProgramID, ix.Outer, ix.Inner, err), h.policy)
 			}
 			for _, emission := range output {
 				ev := Event{
@@ -353,6 +449,7 @@ func (e *Engine) dispatch(ctx context.Context, item input) error {
 		}
 	}
 	for _, ev := range pending {
+		ev.Quality = e.quality(tx.Source)
 		if err := e.sink(ctx, ev); err != nil {
 			return err
 		}
@@ -361,41 +458,10 @@ func (e *Engine) dispatch(ctx context.Context, item input) error {
 	return nil
 }
 
-// Health returns per-source durable observations. A connected source does not
-// prove bank completeness or exact account history.
-func (e *Engine) Health() map[string]SourceHealth {
-	e.healthMu.RLock()
-	defer e.healthMu.RUnlock()
-	out := make(map[string]SourceHealth, len(e.stores))
-	for id, store := range e.stores {
-		cp := store.Snapshot()
-		var h SourceHealth
-		h.Quality = cp.Quality
-		h.ContinuityBroken = cp.ContinuityBroken
-		for _, s := range cp.Sources {
-			h.Connected = h.Connected || s.Connected
-			h.Received += s.Received
-			if s.LastSlot > h.LastSlot {
-				h.LastSlot = s.LastSlot
-			}
-		}
-		out[id] = h
-	}
-	return out
-}
-
-type SourceHealth struct {
-	Connected        bool
-	Received         uint64
-	LastSlot         uint64
-	ContinuityBroken bool
-	Quality          string
-}
-
 func (e *Engine) observeQuality(sourceID string, r lab.Record) {
 	switch r.Kind {
 	case "continuity_broken", "filter_identity_changed", "replay_retention_exceeded",
-		"replay_rejected", "dedupe_conflict", "dedupe_limit", "checkpoint_write_failed":
+		"replay_rejected", "dedupe_conflict", "dedupe_limit", "checkpoint_write_failed", "unreadable_update", "handler_error", "evidence_error":
 		e.qualityMu.Lock()
 		e.broken[sourceID] = true
 		e.qualityMu.Unlock()

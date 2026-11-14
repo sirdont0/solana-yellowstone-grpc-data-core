@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,6 +42,8 @@ func (m *MockGeyser) Subscribe(stream pb.Geyser_SubscribeServer) error {
 	if req.FromSlot != nil && *req.FromSlot < 100 {
 		return status.Error(codes.OutOfRange, "mock replay buffer starts at 100")
 	}
+	var sendMu sync.Mutex
+	send := func(u *pb.SubscribeUpdate) error { sendMu.Lock(); defer sendMu.Unlock(); return stream.Send(u) }
 	count := m.Sessions.Add(1)
 	// An independent receiver serves pings while the sender sends mock updates.
 	done := make(chan struct{})
@@ -52,7 +55,7 @@ func (m *MockGeyser) Subscribe(stream pb.Geyser_SubscribeServer) error {
 				return
 			}
 			if p := r.GetPing(); p != nil {
-				_ = stream.Send(&pb.SubscribeUpdate{UpdateOneof: &pb.SubscribeUpdate_Pong{Pong: &pb.SubscribeUpdatePong{Id: p.GetId()}}})
+				_ = send(&pb.SubscribeUpdate{UpdateOneof: &pb.SubscribeUpdate_Pong{Pong: &pb.SubscribeUpdatePong{Id: p.GetId()}}})
 			}
 		}
 	}()
@@ -62,17 +65,17 @@ func (m *MockGeyser) Subscribe(stream pb.Geyser_SubscribeServer) error {
 	}
 	for i, slot := range slots {
 		meta := &pb.SubscribeUpdate{UpdateOneof: &pb.SubscribeUpdate_BlockMeta{BlockMeta: &pb.SubscribeUpdateBlockMeta{Slot: slot, ParentSlot: slot - 1, Blockhash: fmt.Sprintf("mock-block-%d", slot), BankId: 0}}}
-		if e = stream.Send(meta); e != nil {
+		if e = send(meta); e != nil {
 			return e
 		}
 		sig := make([]byte, 64)
 		sig[0] = byte(i + 1)
 		tx := &pb.SubscribeUpdate{UpdateOneof: &pb.SubscribeUpdate_Transaction{Transaction: &pb.SubscribeUpdateTransaction{Slot: slot, BankId: 0, Transaction: &pb.SubscribeUpdateTransactionInfo{Signature: sig, Index: uint64(i)}}}}
-		if e = stream.Send(tx); e != nil {
+		if e = send(tx); e != nil {
 			return e
 		}
 		if i == 0 {
-			if e = stream.Send(tx); e != nil {
+			if e = send(tx); e != nil {
 				return e
 			}
 		}

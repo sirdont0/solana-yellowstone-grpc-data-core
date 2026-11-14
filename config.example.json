@@ -7,5 +7,10 @@
   "queue_capacity": 4096,
   "dedupe_limit": 2000000,
   "ping_interval_seconds": 15,
-  "idle_timeout_seconds": 45
+  "idle_timeout_seconds": 45,
+  "replay_overlap": 64,
+  "max_reconnects": 0,
+  "decode_error_policy": "fail_closed",
+  "handler_error_policy": "fail_closed",
+  "tolerant_replay_tail": false
 }

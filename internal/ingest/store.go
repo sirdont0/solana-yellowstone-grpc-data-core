@@ -76,11 +76,18 @@ func (s *Store) notifyDurable(r Record) error {
 	return s.onDurable(r)
 }
 
-func OpenStore(c Config) (*Store, error) {
-	s := &Store{cfg: c, dir: c.DataDir, dedupe: make(map[string]string), cp: Checkpoint{Schema: 1, Identity: c.Identity(), FilterVersion: c.FilterVersion, Commitment: c.Commitment, Quality: "OBSERVING_UNVERIFIED", Sources: make(map[string]*SourceState)}}
+func OpenStore(c Config) (*Store, error) { return OpenStoreObserved(c, nil) }
+
+// OpenStoreObserved observes existing WAL records and subsequent durable writes
+// in source order. The callback must not call Store methods.
+func OpenStoreObserved(c Config, observer func(Record) error) (*Store, error) {
+	s := &Store{onDurable: observer, cfg: c, dir: c.DataDir, dedupe: make(map[string]string), cp: Checkpoint{Schema: 1, Identity: c.Identity(), FilterVersion: c.FilterVersion, Commitment: c.Commitment, Quality: "OBSERVING_UNVERIFIED", Sources: make(map[string]*SourceState)}}
 	var previousIdentity string
 	w, e := OpenWAL(filepath.Join(c.DataDir, "journal.wal"), func(r Record) error {
 		if r.Identity != "" {
+			if r.Identity != c.Identity() {
+				return errors.New("WAL subscription identity differs from configuration; use a new DataDir or migrate the old journal")
+			}
 			if previousIdentity != "" && previousIdentity != r.Identity {
 				return errors.New("WAL contains multiple subscription identities; migrate or isolate the journal before replay")
 			}
@@ -97,6 +104,9 @@ func OpenStore(c Config) (*Store, error) {
 		}
 		s.apply(r)
 		s.lastRecord = r
+		if observer != nil {
+			return observer(r)
+		}
 		return nil
 	})
 	if e != nil {
@@ -184,7 +194,7 @@ func (s *Store) apply(r Record) {
 			st.Duplicates++
 		}
 	}
-	if r.Kind == "continuity_broken" || r.Kind == "filter_identity_changed" || r.Kind == "replay_retention_exceeded" || r.Kind == "replay_rejected" || r.Kind == "dedupe_conflict" || r.Kind == "dedupe_limit" || r.Kind == "checkpoint_write_failed" {
+	if r.Kind == "continuity_broken" || r.Kind == "filter_identity_changed" || r.Kind == "replay_retention_exceeded" || r.Kind == "replay_rejected" || r.Kind == "dedupe_conflict" || r.Kind == "dedupe_limit" || r.Kind == "checkpoint_write_failed" || r.Kind == "unreadable_update" || r.Kind == "handler_error" || r.Kind == "evidence_error" {
 		s.cp.ContinuityBroken = true
 		s.cp.Quality = "CONTINUITY_BROKEN"
 		if len(s.cp.BreakReasons) < 50 {

@@ -29,14 +29,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if err = engine.Register(pumpfuncreate.New()); err != nil {
+	handlerPolicy, _ := parsePolicy(settings.HandlerErrorPolicy)
+	if err = engine.RegisterWithPolicy(pumpfuncreate.New(), handlerPolicy); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	if os.Getenv("CORE_REPLAY_ONLY") == "1" {
-		err = engine.Replay(ctx)
+		err = engine.ReplayWithOptions(ctx, core.ReplayOptions{TolerantTail: settings.TolerantReplayTail})
 	} else {
 		err = engine.Run(ctx)
 	}

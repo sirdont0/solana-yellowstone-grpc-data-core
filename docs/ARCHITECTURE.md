@@ -69,7 +69,7 @@ original cross-source interleaving.
 | :--- | :--- |
 | `engine.go` | Source orchestration, handler registration and event sink |
 | `transaction.go` | Raw Yellowstone transaction normalization and instruction positions |
-| `replay.go` | Strict WAL replay through the same dispatch path |
+| `replay.go` | Strict or explicitly tolerant-tail WAL replay through the same dispatch path |
 | `internal/ingest` | Reconnect, bounded ingestion, WAL and source-local evidence |
 | `internal/sourcecfg` | Source configuration validation and loading |
 | `examples/pumpfuncreate` | Example protocol-specific CreateEvent decoding |
@@ -144,3 +144,13 @@ Aggregator V2 or additional protocol packages, not this engine.
 Do not switch a production trading or ML exact state pipeline onto this Core
 until a separate accepted canonical completeness contract exists. The current
 Aggregator V2 P1 and P2 audits retain their BLOCKED/PARTIAL status.
+
+## Audit follow-up API
+
+See [2026-11-15 audit](AUDIT_CLOSURE_2026-11-15.md) for `SkipAndFlag`,
+`ReplayWithOptions`, reconnect controls and durable evidence snapshots.
+Both public transaction decoding and internal occurrence extraction use the
+same normalizer. Unrecorded CPI remains unknown; known-empty CPI is accepted.
+An isolated handler error discards all prepared effects for that transaction.
+Registration and session start are serialized. Replay locks and preflights all
+source WALs before invoking handlers and does not repair files in place.

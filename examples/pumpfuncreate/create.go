@@ -92,7 +92,7 @@ func (r *reader) string() (string, error) {
 		return "", e
 	}
 	if n > 8192 {
-		return "", fmt.Errorf("Borsh string exceeds 8192-byte example limit: %d", n)
+		return "", fmt.Errorf("borsh string exceeds 8192-byte example limit: %d", n)
 	}
 	b, e := r.take(int(n))
 	if e != nil {

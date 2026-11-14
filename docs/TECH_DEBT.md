@@ -23,6 +23,13 @@ with bounded memory; byte-budgeted queues and backlog/latency metrics; and
 downstream delivery/atomic-commit acknowledgement. The current checkpoint is
 diagnostic, and startup still scans the existing WAL to rebuild dedupe state.
 
+The [2026-11-15 follow-up](AUDIT_CLOSURE_2026-11-15.md) additionally implements
+explicit decode isolation, tolerant read-only replay, shared normalization,
+public evidence, basic health counters, structured logging and reconnect controls.
+These improve diagnostics; byte budgets, WAL queue age and latency histograms
+are still open. Release notes/workflow for v0.1.1 are prepared; the old v0.1.0
+tag must not be moved to hide its historical limitations.
+
 ## Deferred recovery work
 
 - A verified full-block oracle for produced slots and filtered transaction
@@ -67,8 +74,8 @@ pre-publication baseline and its then-open conditions.
 - Prove live/replay equivalence for stateful consumers requiring canonical
   ordering; current source WAL replay preserves only source-local order.
 
-- Enable GitHub private vulnerability reporting or publish a working private
-  security contact before inviting external security reports.
+- Private vulnerability reporting was enabled and independently verified on
+  2026-11-15. Recheck this setting on future repository migrations.
 - Review the full tracked tree and Git history for provider credentials,
   private endpoint details, WAL contents and sensitive fixtures. `.gitignore`
   does not remove secrets from existing history.

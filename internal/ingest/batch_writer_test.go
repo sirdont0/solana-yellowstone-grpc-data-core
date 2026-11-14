@@ -64,6 +64,17 @@ func TestBatchDedupeAndDurableReplay(t *testing.T) {
 	if len(accepted) != 2 || !accepted[0] || accepted[1] {
 		t.Fatalf("accepted=%v", accepted)
 	}
+	conflict := r
+	conflict.Digest = "different"
+	if _, err := store.AppendBatch([]Record{conflict}); err == nil {
+		t.Fatal("conflicting batch accepted")
+	}
+	if !store.Snapshot().ContinuityBroken {
+		t.Fatal("conflict did not mark history broken")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
 	var updates, duplicates int
 	if err := ReadWAL(filepath.Join(cfg.DataDir, "journal.wal"), func(x Record) error {
 		if x.Kind == "transaction" {
@@ -78,17 +89,6 @@ func TestBatchDedupeAndDurableReplay(t *testing.T) {
 	}
 	if updates != 1 || duplicates != 1 {
 		t.Fatalf("updates=%d duplicate-markers=%d", updates, duplicates)
-	}
-	conflict := r
-	conflict.Digest = "different"
-	if _, err := store.AppendBatch([]Record{conflict}); err == nil {
-		t.Fatal("conflicting batch accepted")
-	}
-	if !store.Snapshot().ContinuityBroken {
-		t.Fatal("conflict did not mark history broken")
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
 	}
 	reopened, err := OpenStore(cfg)
 	if err != nil {

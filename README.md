@@ -101,7 +101,7 @@ The example writes raw data under `run/`; the directory is Git-ignored. The `.en
 
 Filtered slot sequences can legitimately skip numbers. In particular, `101 → 103 → 109` is **not sufficient** evidence of missing data. See [invariants and quality semantics](docs/ARCHITECTURE.md#invariants).
 
-**Delivery limit:** a synced WAL does not mean that the application's `Sink` committed every event. The public API has no persisted downstream acknowledgement cursor or atomic multi-event sink transaction. On recovery, consumers must replay and deduplicate by stable event ID; exactly-once application effects and cross-source replay order are not guaranteed. Transactions without recorded CPI metadata are rejected rather than silently treated as complete.
+**Delivery limit:** a synced WAL does not mean that the application's `Sink` committed every event. The public API has no persisted downstream acknowledgement cursor or atomic multi-event sink transaction. On recovery, consumers must replay and deduplicate by stable event ID; exactly-once application effects and cross-source replay order are not guaranteed. Missing/unrecorded CPI metadata stops processing by default. Opt-in `SkipAndFlag` skips the whole transaction with durable diagnostics and degraded quality; known-empty CPI is accepted. See the [audit fixes and verification](docs/AUDIT_CLOSURE_2026-11-15.md).
 
 ## Documentation
 
@@ -111,6 +111,7 @@ Filtered slot sequences can legitimately skip numbers. In particular, `101 → 1
 | [Architecture and invariants](docs/ARCHITECTURE.md) | End-to-end flow, evidence, delivery, boundaries and acceptance status |
 | [Aggregator V2 Go/Rust roadmap](docs/AGGREGATOR_V2_ROADMAP.md) · [Русский](docs/AGGREGATOR_V2_ROADMAP.ru.md) | Go-first decision, language-neutral boundary, lifecycle, correctness and performance gates |
 | [Technical debt / release gates](docs/TECH_DEBT.md) | Full-bank verification, account completeness, RPC/SQD recovery and load acceptance |
+| [Audit fixes, 2026-11-15](docs/AUDIT_CLOSURE_2026-11-15.md) | Finding dispositions, regression evidence and remaining release gates |
 | [Public release audit](docs/PUBLIC_RELEASE_AUDIT_2026-11-14.md) | Verified hardening and remaining release conditions |
 | [Contributing](CONTRIBUTING.md) | Local development, tests, PR conventions and decoder rules |
 | [Security policy](SECURITY.md) | Responsible disclosure, secrets and data-integrity risks |

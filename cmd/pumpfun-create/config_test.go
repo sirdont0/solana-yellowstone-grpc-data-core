@@ -86,3 +86,22 @@ func TestSettingsRequirePublicNodeTokenWithoutBlockingTokenlessProviders(t *test
 		t.Fatalf("offline WAL replay should not require provider credentials: %v", err)
 	}
 }
+
+func TestSettingsRecoveryAndIsolationControls(t *testing.T) {
+	writeConfig(t, `{"replay_overlap":91,"max_reconnects":4,"from_slot":123,"decode_error_policy":"skip_and_flag","handler_error_policy":"skip_and_flag","tolerant_replay_tail":true}`)
+	t.Setenv("CORE_REPLAY_ONLY", "1")
+	c, err := loadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := c.coreConfig()
+	if got.ReplayOverlap != 91 || got.MaxReconnects != 4 || got.FromSlot == nil || *got.FromSlot != 123 || got.DecodeErrorPolicy != core.SkipAndFlag || !c.TolerantReplayTail {
+		t.Fatal("recovery settings lost")
+	}
+	for _, raw := range []string{`{"decode_error_policy":"ignore"}`, `{"handler_error_policy":"ignore"}`, `{"max_reconnects":-1}`} {
+		writeConfig(t, raw)
+		if _, err := loadSettings(); err == nil {
+			t.Fatal("invalid error policy accepted")
+		}
+	}
+}

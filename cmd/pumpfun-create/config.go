@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -16,22 +17,28 @@ import (
 // Settings are intentionally non-secret. Provider details and credentials
 // come only from the environment, never from config.json.
 type settings struct {
-	SourceCount         int    `json:"source_count"`
-	Commitment          string `json:"commitment"`
-	Delivery            string `json:"delivery"`
-	FilterVersion       string `json:"filter_version"`
-	DataDir             string `json:"data_dir"`
-	QueueCapacity       int    `json:"queue_capacity"`
-	DedupeLimit         int    `json:"dedupe_limit"`
-	PingIntervalSeconds int    `json:"ping_interval_seconds"`
-	IdleTimeoutSeconds  int    `json:"idle_timeout_seconds"`
+	SourceCount         int     `json:"source_count"`
+	Commitment          string  `json:"commitment"`
+	Delivery            string  `json:"delivery"`
+	FilterVersion       string  `json:"filter_version"`
+	DataDir             string  `json:"data_dir"`
+	QueueCapacity       int     `json:"queue_capacity"`
+	DedupeLimit         int     `json:"dedupe_limit"`
+	PingIntervalSeconds int     `json:"ping_interval_seconds"`
+	IdleTimeoutSeconds  int     `json:"idle_timeout_seconds"`
+	ReplayOverlap       uint64  `json:"replay_overlap"`
+	MaxReconnects       int     `json:"max_reconnects"`
+	FromSlot            *uint64 `json:"from_slot,omitempty"`
+	DecodeErrorPolicy   string  `json:"decode_error_policy"`
+	HandlerErrorPolicy  string  `json:"handler_error_policy"`
+	TolerantReplayTail  bool    `json:"tolerant_replay_tail"`
 	providers           []core.Source
 }
 
 func defaults() settings {
 	return settings{SourceCount: 1, Commitment: "finalized", Delivery: "provisional",
 		FilterVersion: "pumpfun-create-v1", DataDir: "./run", QueueCapacity: 4096,
-		DedupeLimit: 2_000_000, PingIntervalSeconds: 15, IdleTimeoutSeconds: 45}
+		DedupeLimit: 2_000_000, PingIntervalSeconds: 15, IdleTimeoutSeconds: 45, ReplayOverlap: 64, DecodeErrorPolicy: "fail_closed", HandlerErrorPolicy: "fail_closed"}
 }
 
 func getenv(primary, legacy, fallback string) string {
@@ -76,6 +83,15 @@ func loadSettings() (settings, error) {
 	if c.FilterVersion == "" || c.DataDir == "" || c.QueueCapacity < 1 || c.DedupeLimit < 1 ||
 		c.PingIntervalSeconds < 1 || c.IdleTimeoutSeconds <= c.PingIntervalSeconds {
 		return c, errors.New("invalid filter_version, data_dir, queue_capacity, dedupe_limit or timeout settings")
+	}
+	if c.MaxReconnects < 0 {
+		return c, errors.New("max_reconnects must be nonnegative")
+	}
+	if _, err := parsePolicy(c.DecodeErrorPolicy); err != nil {
+		return c, err
+	}
+	if _, err := parsePolicy(c.HandlerErrorPolicy); err != nil {
+		return c, err
 	}
 	a := core.Source{
 		ID: "primary", Endpoint: getenv("CORE_PROVIDER_A_ENDPOINT", "CORE_ENDPOINT", "solana-yellowstone-grpc.publicnode.com:443"),
@@ -125,10 +141,24 @@ func (c settings) coreConfig() core.Config {
 	if c.Delivery == "durable" {
 		mode = core.Durable
 	}
+	policy, _ := parsePolicy(c.DecodeErrorPolicy)
 	return core.Config{
 		Sources: c.providers, DataDir: c.DataDir, Delivery: mode,
+		ReplayOverlap: c.ReplayOverlap, MaxReconnects: c.MaxReconnects, FromSlot: c.FromSlot, DecodeErrorPolicy: policy,
+		Logger:        slog.New(slog.NewJSONHandler(os.Stderr, nil)),
 		QueueCapacity: c.QueueCapacity, DedupeLimit: c.DedupeLimit,
 		PingInterval: time.Duration(c.PingIntervalSeconds) * time.Second,
 		IdleTimeout:  time.Duration(c.IdleTimeoutSeconds) * time.Second,
+	}
+}
+
+func parsePolicy(s string) (core.ErrorPolicy, error) {
+	switch s {
+	case "fail_closed":
+		return core.FailClosed, nil
+	case "skip_and_flag":
+		return core.SkipAndFlag, nil
+	default:
+		return core.FailClosed, errors.New("error policy must be fail_closed or skip_and_flag")
 	}
 }

@@ -136,20 +136,20 @@ func TestOccurrencesRejectMissingALTAndInvalidProgramIndex(t *testing.T) {
 				AddressTableLookups: []*pb.MessageAddressTableLookup{{AccountKey: static, WritableIndexes: []byte{0}}},
 				Instructions:        []*pb.CompiledInstruction{{ProgramIdIndex: 1}}},
 			meta:      &pb.TransactionStatusMeta{},
-			wantError: "program index 1 outside 1 keys",
+			wantError: "account index 1 outside 1 keys",
 		},
 		{
 			name:    "out-of-range inner CPI index",
 			message: &pb.Message{AccountKeys: [][]byte{static}, Instructions: []*pb.CompiledInstruction{{ProgramIdIndex: 0}}},
 			meta: &pb.TransactionStatusMeta{LoadedWritableAddresses: [][]byte{loaded},
 				InnerInstructions: []*pb.InnerInstructions{{Index: 0, Instructions: []*pb.InnerInstruction{{ProgramIdIndex: 2}}}}},
-			wantError: "program index 2 outside 2 keys",
+			wantError: "account index 2 outside 2 keys",
 		},
 		{
 			name:      "invalid loaded address length",
 			message:   &pb.Message{AccountKeys: [][]byte{static}, Instructions: []*pb.CompiledInstruction{{ProgramIdIndex: 1}}},
 			meta:      &pb.TransactionStatusMeta{LoadedReadonlyAddresses: [][]byte{{1, 2, 3}}},
-			wantError: "invalid pubkey byte count at 1",
+			wantError: "invalid account key size 3",
 		},
 	}
 	for _, tc := range cases {
