@@ -2,6 +2,11 @@
 
 [← Home](../README.md) · [Architecture](ARCHITECTURE.md) · [Technical debt](TECH_DEBT.md) · [Security](../SECURITY.md)
 
+> Historical pre-publication audit. The public `v0.1.0` release was subsequently
+> published on 2026-11-14, with anonymous clone/module import and GitHub Actions
+> verified. Current development fixes and open gates are tracked in
+> [Technical debt](TECH_DEBT.md) and the [Aggregator V2 roadmap](AGGREGATOR_V2_ROADMAP.md).
+
 ## Decision
 
 **Conditional for an experimental public source release. Not approved as an

@@ -1,6 +1,6 @@
 # Solana Yellowstone gRPC Data Core — English
 
-[← Home](../README.md) · [🇬🇧 English](README.en.md) · [🇷🇺 Русский](README.ru.md) · [Architecture](ARCHITECTURE.md) · [Technical debt](TECH_DEBT.md) · [Contributing](../CONTRIBUTING.md) · [Security](../SECURITY.md)
+[← Home](../README.md) · [🇬🇧 English](README.en.md) · [🇷🇺 Русский](README.ru.md) · [Architecture](ARCHITECTURE.md) · [Aggregator V2 roadmap](AGGREGATOR_V2_ROADMAP.md) · [Technical debt](TECH_DEBT.md) · [Contributing](../CONTRIBUTING.md) · [Security](../SECURITY.md)
 
 ## Overview
 
@@ -63,19 +63,18 @@ The environment also accepts the legacy CORE_ENDPOINT/CORE_TOKEN and CORE_ENDPOI
 
 Import the module directly in your Go application. The engine invokes handlers and your sink **in-process**, without another gRPC hop between Core and the consuming application.
 
-If the repository is private, configure your machine's GitHub credentials and
-tell Go to bypass the public module proxy and checksum database for this owner:
+The repository is public. Pin the published experimental release for a
+reproducible dependency; no `GOPRIVATE` override is needed:
 
-    go env -w 'GOPRIVATE=github.com/sirdont0/*'
-    go get github.com/sirdont0/solana-yellowstone-grpc-data-core@main
+    go get github.com/sirdont0/solana-yellowstone-grpc-data-core@v0.1.0
 
 For local development alongside Aggregator V2, use a sibling directory and a
 temporary replace directive instead of depending on a remote branch:
 
     go mod edit -replace=github.com/sirdont0/solana-yellowstone-grpc-data-core=../solana-yellowstone-grpc-data-core
 
-For reproducible releases, pin an immutable version tag or commit after
-publishing; remove the local replace directive when no longer needed. The
+For reproducible builds, keep an immutable version tag or commit and remove
+the local replace directive when no longer needed. The
 following code illustrates the API inside a consuming Go function; `endpoint`,
 `token`, `consumer` and `ctx` must be supplied by that application. It is not
 a complete standalone Go program:

@@ -52,3 +52,49 @@ func TestProvisionalPrecedesWALAndDurableCallback(t *testing.T) {
 		t.Fatalf("callback order/durability incorrect: %+v %+v", first, second)
 	}
 }
+
+func TestCancellationAfterRecvStillPersistsObservation(t *testing.T) {
+	s := &scriptedGeyser{onSubscribe: func(_ int, _ *pb.SubscribeRequest, stream pb.Geyser_SubscribeServer) error {
+		if err := stream.Send(txUpdate(888, 4)); err != nil {
+			return err
+		}
+		<-stream.Context().Done()
+		return nil
+	}}
+	c := integrationConfig(t, loopbackGeyser(t, s))
+	store, err := OpenStore(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	runner := NewRunner(c, store)
+	seen := false
+	runner.OnProvisional = func(rec Record) {
+		if rec.Kind == "transaction" {
+			seen = true
+			cancel() // Happens after Recv, before its WAL enqueue.
+		}
+	}
+	if err := runner.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !seen || store.Snapshot().Sources["A"].LastTxSlot != 888 {
+		t.Fatal("received update was silently lost during graceful cancellation")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	updates := 0
+	if err := ReadWAL(c.DataDir+"/journal.wal", func(rec Record) error {
+		if rec.Type == "update" && rec.Kind == "transaction" && rec.Slot == 888 {
+			updates++
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if updates != 1 {
+		t.Fatalf("expected one durable observation, got %d", updates)
+	}
+}

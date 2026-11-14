@@ -25,6 +25,7 @@ import (
 
 var errForcedDrop = errors.New("injected stream disconnect")
 var errIdle = errors.New("stream idle watchdog fired")
+var errDurableWriterFailed = errors.New("durable WAL writer failed")
 
 type Dialer func(context.Context, Config) (*grpc.ClientConn, error)
 
@@ -151,6 +152,10 @@ func (r *Runner) runSource(ctx context.Context, source string) error {
 		}
 		err := r.runOnce(ctx, source, gen, from)
 		if ctx.Err() != nil {
+			if errors.Is(err, errDurableWriterFailed) {
+				markErr := r.Store.Mark(source, gen, "continuity_broken", "durable writer failed during shutdown; recovery required")
+				return errors.Join(err, markErr)
+			}
 			return nil
 		}
 		if err == nil {
@@ -164,6 +169,9 @@ func (r *Runner) runSource(ctx context.Context, source string) error {
 		}
 		if e := r.Store.Mark(source, gen, "continuity_broken", "stream interrupted; replay/RPC reconciliation required: "+sanitizeErr(err, r.Config.Token)); e != nil {
 			return e
+		}
+		if errors.Is(err, errDurableWriterFailed) {
+			return err // Storage/integrity failure is terminal; reconnect cannot fix it.
 		}
 		fmt.Fprintf(os.Stderr, "stream=%s generation=%d disconnect=%s\n", source, gen, sanitizeErr(err, r.Config.Token))
 		if from != nil && isReplayRejection(err) {
@@ -232,11 +240,11 @@ func (r *Runner) runOnce(parent context.Context, source string, gen uint64, from
 	}
 	// Keep Recv independent of synchronous disk flush. The bounded queue gives
 	// explicit backpressure if the writer cannot keep up.
-	writeQueue, writeDone := r.startBatchedWriter(cancel)
+	writeQueue, writeDone, writerStopped := r.startBatchedWriter(cancel)
 	defer func() {
 		close(writeQueue)
 		if writeErr := <-writeDone; writeErr != nil {
-			retErr = writeErr
+			retErr = fmt.Errorf("%w: %w", errDurableWriterFailed, writeErr)
 		}
 	}()
 	var lastRecv atomic.Int64
@@ -288,10 +296,13 @@ func (r *Runner) runOnce(parent context.Context, source string, gen uint64, from
 		if r.OnProvisional != nil {
 			r.OnProvisional(rec)
 		}
+		// Once Recv succeeded, cancellation must not silently discard the
+		// observation. The writer drains this queue before runOnce returns.
+		// A stopped writer is a fatal error, even during graceful shutdown.
 		select {
 		case writeQueue <- rec:
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-writerStopped:
+			return errDurableWriterFailed
 		}
 		observed++
 		if r.Config.ForceDropAfter > 0 && !r.Forced.Load() && observed >= r.Config.ForceDropAfter {

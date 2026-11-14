@@ -10,6 +10,13 @@ import (
 	"time"
 )
 
+var (
+	// These errors are terminal for the current journal. Reconnecting cannot
+	// resolve a durable identity conflict or replenish a lifetime dedupe budget.
+	ErrDedupeConflict = errors.New("dedupe conflict: continuity broken")
+	ErrDedupeLimit    = errors.New("dedupe capacity exhausted")
+)
+
 type SourceState struct {
 	Generation    uint64    `json:"generation"`
 	LastSlot      uint64    `json:"last_slot"`
@@ -74,6 +81,9 @@ func OpenStore(c Config) (*Store, error) {
 	var previousIdentity string
 	w, e := OpenWAL(filepath.Join(c.DataDir, "journal.wal"), func(r Record) error {
 		if r.Identity != "" {
+			if previousIdentity != "" && previousIdentity != r.Identity {
+				return errors.New("WAL contains multiple subscription identities; migrate or isolate the journal before replay")
+			}
 			previousIdentity = r.Identity
 		}
 		if r.DedupeKey != "" {
@@ -93,6 +103,10 @@ func OpenStore(c Config) (*Store, error) {
 		return nil, e
 	}
 	s.wal = w
+	if previousIdentity != "" && previousIdentity != c.Identity() {
+		_ = w.Close()
+		return nil, errors.New("WAL subscription identity differs from configuration; use a new DataDir or migrate the old journal")
+	}
 	wasClean := s.lastRecord.Type == "" || (s.lastRecord.Type == "marker" && s.lastRecord.Kind == "session_end")
 	// Replaying WAL records from an earlier process can recover historical state,
 	// but no earlier transport connection remains live in this process.
@@ -101,12 +115,6 @@ func OpenStore(c Config) (*Store, error) {
 	}
 	if w.RecoveredTail {
 		if e = s.Mark("", 0, "continuity_broken", "torn WAL tail truncated on startup"); e != nil {
-			s.Close()
-			return nil, e
-		}
-	}
-	if previousIdentity != "" && previousIdentity != c.Identity() {
-		if e = s.Mark("", 0, "filter_identity_changed", "subscription identity differs from previous WAL segment; historical coverage uncertain"); e != nil {
 			s.Close()
 			return nil, e
 		}
@@ -204,7 +212,7 @@ func (s *Store) Append(r Record) (bool, error) {
 				if err := s.notifyDurable(r); err != nil {
 					return false, err
 				}
-				return false, errors.New("dedupe conflict: continuity broken")
+				return false, ErrDedupeConflict
 			}
 			m := Marker(s.cfg, r.Source, r.Generation, "duplicate", "exact repeat of a previously durable record")
 			m.Slot, m.BankID, m.Signature, m.TxIndex, m.Digest = r.Slot, r.BankID, r.Signature, r.TxIndex, r.Digest
@@ -228,7 +236,7 @@ func (s *Store) Append(r Record) (bool, error) {
 			if err := s.notifyDurable(m); err != nil {
 				return false, err
 			}
-			return false, errors.New("dedupe capacity exhausted")
+			return false, ErrDedupeLimit
 		}
 	}
 	if err := s.wal.Append(r); err != nil {
@@ -269,7 +277,7 @@ func (s *Store) AppendBatch(records []Record) ([]bool, error) {
 				if old != r.Digest {
 					m := Marker(s.cfg, r.Source, r.Generation, "dedupe_conflict", "same source/slot/index/signature but different payload digest")
 					prepared = append(prepared, m)
-					stopErr = errors.New("dedupe conflict: continuity broken")
+					stopErr = ErrDedupeConflict
 					break
 				}
 				m := Marker(s.cfg, r.Source, r.Generation, "duplicate", "exact repeat of a previously durable record")
@@ -279,7 +287,7 @@ func (s *Store) AppendBatch(records []Record) ([]bool, error) {
 			}
 			if len(s.dedupe)+len(pending) >= s.cfg.DedupeLimit {
 				prepared = append(prepared, Marker(s.cfg, r.Source, r.Generation, "dedupe_limit", "exact dedupe memory budget exhausted"))
-				stopErr = errors.New("dedupe capacity exhausted")
+				stopErr = ErrDedupeLimit
 				break
 			}
 			pending[r.DedupeKey] = r.Digest

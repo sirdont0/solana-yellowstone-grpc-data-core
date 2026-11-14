@@ -249,10 +249,10 @@ func (e *Engine) Run(parent context.Context) error {
 			if rec.Kind != "transaction" {
 				return
 			}
-			select {
-			case in <- input{rec: rec, durable: durable}:
-			case <-ctx.Done():
-			}
+			// The dispatch loop drains this bounded channel even after cancel.
+			// Dropping a durable callback here would leave a synced WAL record
+			// undelivered while allowing a misleading clean session_end marker.
+			in <- input{rec: rec, durable: durable}
 		}
 		if e.cfg.Delivery == Provisional {
 			runner.OnProvisional = func(rec lab.Record) { send(rec, false) }

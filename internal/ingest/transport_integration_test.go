@@ -211,6 +211,47 @@ func TestSparseMatchingSlotsDoNotImplyGap(t *testing.T) {
 	}
 }
 
+func TestDedupeConflictIsTerminalWithoutReconnect(t *testing.T) {
+	s := &scriptedGeyser{onSubscribe: func(_ int, _ *pb.SubscribeRequest, stream pb.Geyser_SubscribeServer) error {
+		first := txUpdate(707, 9)
+		conflict := txUpdate(707, 9)
+		conflict.GetTransaction().GetTransaction().Meta = &pb.TransactionStatusMeta{Fee: 1}
+		if err := stream.Send(first); err != nil {
+			return err
+		}
+		if err := stream.Send(conflict); err != nil {
+			return err
+		}
+		<-stream.Context().Done()
+		return nil
+	}}
+	c := integrationConfig(t, loopbackGeyser(t, s))
+	store, err := OpenStore(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Abort()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var delivered atomic.Int32
+	runner := NewRunner(c, store)
+	runner.OnLive = func(rec Record) {
+		if rec.Kind == "transaction" {
+			delivered.Add(1)
+		}
+	}
+	err = runner.Run(ctx)
+	if !errors.Is(err, errDurableWriterFailed) || !errors.Is(err, ErrDedupeConflict) {
+		t.Fatalf("expected terminal durable dedupe conflict, got %v", err)
+	}
+	if s.sessions.Load() != 1 {
+		t.Fatalf("terminal failure triggered %d connection attempts", s.sessions.Load())
+	}
+	if delivered.Load() != 1 || !store.Snapshot().ContinuityBroken {
+		t.Fatalf("accepted prefix not delivered or quality not broken: delivered=%d quality=%+v", delivered.Load(), store.Snapshot())
+	}
+}
+
 func TestReconnectOverlapAndPersistentDedupe(t *testing.T) {
 	s := &scriptedGeyser{onSubscribe: func(n int, req *pb.SubscribeRequest, stream pb.Geyser_SubscribeServer) error {
 		if n == 1 {

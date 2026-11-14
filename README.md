@@ -11,7 +11,7 @@ Multi-source Yellowstone gRPC · crash-aware WAL · transaction/CPI decoding · 
 [![License: MIT](https://img.shields.io/badge/code%20license-MIT-2ea44f)](LICENSE)
 [![Protocol: Yellowstone](https://img.shields.io/badge/protocol-Yellowstone%20gRPC-7158e2)](https://github.com/rpcpool/yellowstone-grpc)
 
-**[Get started](#quick-start)** · **[Architecture](#architecture-at-a-glance)** · **[Documentation](#documentation)** · **[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)**
+**[Get started](#quick-start)** · **[Architecture](#architecture-at-a-glance)** · **[Aggregator V2 roadmap](docs/AGGREGATOR_V2_ROADMAP.md)** · **[Documentation](#documentation)** · **[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)**
 
 [🇬🇧 English](docs/README.en.md) · [🇷🇺 Русский](docs/README.ru.md)
 
@@ -63,7 +63,7 @@ Choose **one delivery mode** per engine run: `Provisional` dispatches before sou
 
 ## Quick start
 
-**Requirements:** Go 1.26.11+, access to a Yellowstone gRPC endpoint, and GitHub read access if the repository is still private.
+**Requirements:** Go 1.26.11+ and access to a Yellowstone gRPC endpoint. This source repository is public.
 
 ```bash
 git clone https://github.com/sirdont0/solana-yellowstone-grpc-data-core.git
@@ -109,6 +109,7 @@ Filtered slot sequences can legitimately skip numbers. In particular, `101 → 1
 | :--- | :--- |
 | [🇬🇧 English](docs/README.en.md) · [🇷🇺 Русский](docs/README.ru.md) | Installation, configuration, API integration and examples |
 | [Architecture and invariants](docs/ARCHITECTURE.md) | End-to-end flow, evidence, delivery, boundaries and acceptance status |
+| [Aggregator V2 Go/Rust roadmap](docs/AGGREGATOR_V2_ROADMAP.md) · [Русский](docs/AGGREGATOR_V2_ROADMAP.ru.md) | Go-first decision, language-neutral boundary, lifecycle, correctness and performance gates |
 | [Technical debt / release gates](docs/TECH_DEBT.md) | Full-bank verification, account completeness, RPC/SQD recovery and load acceptance |
 | [Public release audit](docs/PUBLIC_RELEASE_AUDIT_2026-11-14.md) | Verified hardening and remaining release conditions |
 | [Contributing](CONTRIBUTING.md) | Local development, tests, PR conventions and decoder rules |

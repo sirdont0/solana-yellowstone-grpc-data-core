@@ -8,13 +8,15 @@ import (
 // startBatchedWriter decouples Yellowstone Recv from disk writes. Within one
 // source, writes and durable callbacks retain receive order. Queue saturation
 // blocks Recv rather than silently dropping observations.
-func (r *Runner) startBatchedWriter(cancel context.CancelFunc) (chan Record, <-chan error) {
+func (r *Runner) startBatchedWriter(cancel context.CancelFunc) (chan Record, <-chan error, <-chan struct{}) {
 	const queueCapacity = 4096
 	const batchSize = 128
 	const batchWait = 5 * time.Millisecond
 	in := make(chan Record, queueCapacity)
 	done := make(chan error, 1)
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		timer := time.NewTimer(time.Hour)
 		if !timer.Stop() {
 			select {
@@ -29,15 +31,18 @@ func (r *Runner) startBatchedWriter(cancel context.CancelFunc) (chan Record, <-c
 				return nil
 			}
 			accepted, err := r.Store.AppendBatch(batch)
-			if err != nil {
-				return err
-			}
+			// A conflict later in the batch may return an error after earlier
+			// records were successfully fsynced. Deliver those accepted records
+			// before stopping. A failed fsync returns nil accepted and delivers none.
 			if r.OnLive != nil {
 				for i, ok := range accepted {
 					if ok {
 						r.OnLive(batch[i])
 					}
 				}
+			}
+			if err != nil {
+				return err
 			}
 			batch = batch[:0]
 			return nil
@@ -91,5 +96,5 @@ func (r *Runner) startBatchedWriter(cancel context.CancelFunc) (chan Record, <-c
 			}
 		}
 	}()
-	return in, done
+	return in, done, stopped
 }

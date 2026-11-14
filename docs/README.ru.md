@@ -1,6 +1,6 @@
 # Solana Yellowstone gRPC Data Core — Русский
 
-[← Главная](../README.md) · [🇬🇧 English](README.en.md) · [🇷🇺 Русский](README.ru.md) · [Архитектура](ARCHITECTURE.md) · [Технический долг](TECH_DEBT.md) · [Участие](../CONTRIBUTING.md) · [Безопасность](../SECURITY.md)
+[← Главная](../README.md) · [🇬🇧 English](README.en.md) · [🇷🇺 Русский](README.ru.md) · [Архитектура](ARCHITECTURE.md) · [План Aggregator V2](AGGREGATOR_V2_ROADMAP.ru.md) · [Технический долг](TECH_DEBT.md) · [Участие](../CONTRIBUTING.md) · [Безопасность](../SECURITY.md)
 
 ## Обзор
 
@@ -63,11 +63,10 @@ Go не читает .env автоматически: переменные ну�
 
 Библиотека импортируется в Go-приложение; обработчики и sink вызываются **в том же процессе**, без дополнительного gRPC между ядром и агрегатором.
 
-Если репозиторий приватный, настрой доступ Git к GitHub и отключи публичный
-Go proxy/checksum DB для модулей этого пользователя:
+Репозиторий публичный. Для воспроизводимой зависимости используй
+опубликованный экспериментальный релиз; `GOPRIVATE` не требуется:
 
-    go env -w 'GOPRIVATE=github.com/sirdont0/*'
-    go get github.com/sirdont0/solana-yellowstone-grpc-data-core@main
+    go get github.com/sirdont0/solana-yellowstone-grpc-data-core@v0.1.0
 
 При локальной разработке рядом с Aggregator V2 можно использовать соседнюю
 папку и временный replace:

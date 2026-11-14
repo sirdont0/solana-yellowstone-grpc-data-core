@@ -24,7 +24,7 @@ go vet ./...
 git diff --check
 ```
 
-Run `gofmt` on changed Go files. The normal unit tests do not require a live provider. If the repository remains private, access requires authenticated Git credentials. For imports from private Go modules, see the [English integration guide](docs/README.en.md#integration).
+Run `gofmt` on changed Go files. The normal unit tests do not require a live provider. This repository is public; use a pinned module tag as described in the [English integration guide](docs/README.en.md#integration).
 
 ## What belongs in Core
 

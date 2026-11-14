@@ -1,6 +1,6 @@
 # Architecture and acceptance contract
 
-[← Home](../README.md) · [🇬🇧 English](README.en.md) · [🇷🇺 Русский](README.ru.md) · [Technical debt](TECH_DEBT.md)
+[← Home](../README.md) · [🇬🇧 English](README.en.md) · [🇷🇺 Русский](README.ru.md) · [Aggregator V2 roadmap](AGGREGATOR_V2_ROADMAP.md) · [Technical debt](TECH_DEBT.md)
 
 The goal is a reusable Solana event foundation consumed as a Go library by
 Aggregator V2, the trading bot and future indexing tools.
@@ -77,6 +77,13 @@ original cross-source interleaving.
 Protocol economics, canonical token state, market history, account ownership
 and trading execution remain application responsibilities.
 
+The accepted Go-first integration decision and proposed language-neutral
+observation boundary are detailed in the [Aggregator V2 roadmap](AGGREGATOR_V2_ROADMAP.md).
+The boundary is **not implemented** by this release: the public API still
+passes Go types within one process. A future Rust sidecar must preserve the
+same source evidence and WAL ownership semantics without claiming canonical
+state from transport acknowledgements.
+
 There is no additional network hop between the Go engine and application
 decoders. Source and application configuration are separate. For throughput,
 applications should keep handler work brief and hand data to bounded
@@ -92,6 +99,11 @@ application-owned workers; Core itself never invents business events.
    conflicting copies stop dispatch rather than silently combining.
 3. Every raw update is either durably appended in receive order or its stream
    fails closed. WAL torn tails and CRC errors are reported.
+   Once `Recv` succeeds, graceful cancellation drains the accepted update
+   through the source WAL writer; a terminal writer error is surfaced rather
+   than retried indefinitely. An incompatible subscription identity is
+   rejected for an existing WAL directory; use a new directory or explicit
+   migration to avoid mixing historical filters.
 4. `Provisional` events may precede WAL durability. `Durable` events are
    emitted only after the source WAL reports successful fsync.
    Neither mode records downstream sink acknowledgements: a crash can leave
@@ -119,6 +131,9 @@ Aggregator V2 or additional protocol packages, not this engine.
   standalone module and inherited lab tests.
 - Batch fsync/receive decoupling: **implemented**, with local regression tests;
   live load/performance acceptance remains open.
+- Durable batch prefix delivery on dedupe conflict, cancellation drain and
+  terminal writer error propagation: **implemented and regression-tested**;
+  persistent downstream acknowledgement remains open.
 - Cross-source duplicate suppression of emitted transactions: **implemented**
   for observed identical finalized identities; no bank-completeness proof.
 - Canonical bank acceptance and completeness oracle: **unverified**.

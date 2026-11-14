@@ -243,7 +243,7 @@ func TestWALFullFrameChecksumCorruptionIsRejected(t *testing.T) {
 	}
 }
 
-func TestStoreFilterIdentityChangeMarksUnverifiedHistory(t *testing.T) {
+func TestStoreRejectsFilterIdentityChangeWithoutMutatingWAL(t *testing.T) {
 	c := recoveryConfig(t)
 	s, err := OpenStore(c)
 	if err != nil {
@@ -253,23 +253,30 @@ func TestStoreFilterIdentityChangeMarksUnverifiedHistory(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
+	path := filepath.Join(c.DataDir, "journal.wal")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	other := c
 	other.FilterVersion = "different-subscription-v2"
-	restarted, err := OpenStore(other)
+	if _, err := OpenStore(other); err == nil || !strings.Contains(err.Error(), "identity") {
+		t.Fatalf("filter change should be rejected without mixing journal epochs: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("rejected subscription identity mutated the old WAL")
+	}
+	restarted, err := OpenStore(c)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer restarted.Close()
 	cp := restarted.Snapshot()
-	if cp.Identity != other.Identity() || !cp.ContinuityBroken || !strings.Contains(strings.Join(cp.BreakReasons, "\n"), "filter_identity_changed") {
-		t.Fatalf("filter change did not mark historical uncertainty: %+v", cp)
-	}
-	if cp.Sources["A"].LastTxSlot != 601 || cp.TxInclusionVerifiedThrough != 0 || cp.AccountHistoryVerifiedThrough != 0 {
-		t.Fatalf("filter change lost prior observations or promoted verification: %+v", cp)
-	}
-	// The original Store did close cleanly. A filter change may invalidate
-	// coverage, but it must not fabricate an unclean-shutdown diagnosis.
-	if strings.Contains(strings.Join(cp.BreakReasons, "\n"), "previous process did not end") {
-		t.Error("filter change on clean restart falsely reported a process crash")
+	if cp.ContinuityBroken || cp.Sources["A"].LastTxSlot != 601 || cp.TxInclusionVerifiedThrough != 0 || cp.AccountHistoryVerifiedThrough != 0 {
+		t.Fatalf("old subscription could not recover cleanly: %+v", cp)
 	}
 }
