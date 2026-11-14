@@ -27,8 +27,8 @@ The [2026-11-15 follow-up](AUDIT_CLOSURE_2026-11-15.md) additionally implements
 explicit decode isolation, tolerant read-only replay, shared normalization,
 public evidence, basic health counters, structured logging and reconnect controls.
 These improve diagnostics; byte budgets, WAL queue age and latency histograms
-are still open. Release notes/workflow for v0.1.1 are prepared; the old v0.1.0
-tag must not be moved to hide its historical limitations.
+are still open. The experimental v0.1.1 release includes these repairs; its workflow gates
+publication on CI. The old v0.1.0 tag remains immutable.
 
 ## Deferred recovery work
 

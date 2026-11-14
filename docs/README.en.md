@@ -63,12 +63,11 @@ The environment also accepts the legacy CORE_ENDPOINT/CORE_TOKEN and CORE_ENDPOI
 
 Import the module directly in your Go application. The engine invokes handlers and your sink **in-process**, without another gRPC hop between Core and the consuming application.
 
-The repository is public. `v0.1.0` lacks subsequent WAL repairs. Until the
-prepared `v0.1.1` tag is published, the immutable public hardening baseline below
-is safer than that old tag; it does not include the additional audit-branch fixes.
-No `GOPRIVATE` override is needed:
+The repository is public. Pin the experimental `v0.1.1` release, which includes
+WAL hardening and the 2026-11-15 audit fixes. The old `v0.1.0` tag lacks those
+repairs. No `GOPRIVATE` override is needed:
 
-    go get github.com/sirdont0/solana-yellowstone-grpc-data-core@881448f84d466fe5fa33a9ef0a595fb71713c710
+    go get github.com/sirdont0/solana-yellowstone-grpc-data-core@v0.1.1
 
 For local development alongside Aggregator V2, use a sibling directory and a
 temporary replace directive instead of depending on a remote branch:

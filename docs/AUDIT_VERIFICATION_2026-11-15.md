@@ -41,7 +41,12 @@ go test -run '^$' -fuzz=FuzzDecodeRawTransaction -fuzztime=8s -parallel=4 .
 go test -run '^$' -bench=BenchmarkDecodeTransaction -benchmem .
 ```
 
-GitHub Actions on this new commit, published `v0.1.1` resolution through the
-public Go proxy and live provider compatibility are not claimed by these local
-results. Release publication requires the separately prepared tag workflow.
-No production ingest/trading process was started or switched.
+Local checks do not substitute for remote CI or real-provider acceptance.
+The [v0.1.1 release](https://github.com/sirdont0/solana-yellowstone-grpc-data-core/releases/tag/v0.1.1)
+is published only after the tag's Go workflow succeeds. The audit implementation
+commit is `2a05708bba9b9073abdb18697c8e8f71497322ac`; the release also includes a
+documentation-only commit updating the install pin and release disposition.
+Current [GitHub Actions results](https://github.com/sirdont0/solana-yellowstone-grpc-data-core/actions)
+and the immutable tag identify the remote verification boundary. Live provider
+compatibility and production load acceptance remain unverified. No production
+ingest/trading process was started or switched.
