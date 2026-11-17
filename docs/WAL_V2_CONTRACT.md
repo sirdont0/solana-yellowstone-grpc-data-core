@@ -38,8 +38,10 @@ model.
 ## Proposed on-disk structure
 
 The current opt-in implementation uses `data_dir/source/journal.v2/` with
-`CURRENT`, `manifests/` and `segments/`. The structure below describes an
-extended target with persistent indexes/checkpoints that are not yet built.
+`CURRENT`, `manifests/`, `segments/` and optional `indexes/`. Verified writer
+reopens persist sealed seek indexes. Offline readers use but never write these
+caches. The structure below remains an extended target: durable recovery
+checkpoints and incremental dedupe recovery are not yet built.
 
 ```
 data_dir/source/

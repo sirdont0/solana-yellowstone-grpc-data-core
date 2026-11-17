@@ -208,6 +208,26 @@ not be added to its closure list as mandatory application functionality.
 
 ## Reproduce
 
+### Follow-up after publication of the audit branch
+
+The audited baseline was committed as `ecd04a8` and pushed to the public
+`codex/core-audit-2026-11-15` branch. Subsequent work implements optional
+checksummed sealed-segment indexes in `journal.v2/indexes/`. A verified writer
+reopen saves missing/rebuilt indexes; read-only readers never publish caches.
+The cache binds the complete segment metadata and content digest. Every open
+still hashes the segment and checks its footer, and every cached seek anchor
+is checked against its actual frame. Invalid/missing caches fall back to a
+full frame scan; cache-write failure does not fail valid WAL recovery.
+
+Tests cover valid reuse, missing/truncated caches, stale digest, incorrect
+offset with a freshly computed cache checksum, corruption between anchors,
+offline read-only behavior and failed cache publication. The full race suite,
+vet, staticcheck and build pass. This advances task 2 above; it does **not**
+close accelerated startup as a whole. Hashing remains O(history bytes), and
+Store/dedupe replay still processes history. No retention feature was added.
+
+### Commands
+
 Run from the public repository root:
 
 ```sh

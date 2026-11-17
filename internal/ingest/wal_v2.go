@@ -84,6 +84,7 @@ type walV2Segment struct {
 	meta        walV2SegmentMeta
 	headerBytes int64
 	index       []walIndex
+	indexCached bool
 }
 
 type segmentedWAL struct {
@@ -230,6 +231,12 @@ func (w *segmentedWAL) open(source, identity string, visit func(Record) error) e
 	}
 	if err := w.validateAndVisit(visit); err != nil {
 		return err
+	}
+	for _, segment := range w.sealed {
+		if !segment.indexCached {
+			// Cache publication is best effort and never changes committed data.
+			_ = saveWALV2Index(w.dir, segment.meta, segment.headerBytes, segment.index)
+		}
 	}
 	// Old manifests are no longer needed after a verified reopen. Keep a
 	// short diagnostic history; recovery still uses only CURRENT and never
@@ -1287,13 +1294,6 @@ func openAndVerifyWALV2Sealed(dir string, meta walV2SegmentMeta, manifest walV2M
 	if err := validateWALV2Header(header, manifest, meta.ID, meta.FirstSequence); err != nil {
 		return walV2Segment{}, err
 	}
-	index, count, last, err := scanWALV2Data(file, header, headerBytes, meta.DataBytes, meta.FirstSequence, nil)
-	if err != nil {
-		return walV2Segment{}, err
-	}
-	if count != meta.Records || last != meta.LastSequence {
-		return walV2Segment{}, errors.New("sealed segment record count or sequence mismatch")
-	}
 	footer, err := readWALV2Footer(file, meta.DataBytes)
 	if err != nil {
 		return walV2Segment{}, err
@@ -1311,12 +1311,24 @@ func openAndVerifyWALV2Sealed(dir string, meta walV2SegmentMeta, manifest walV2M
 		footer.Digest != digest || (meta.Digest != "" && hex.EncodeToString(digest[:]) != meta.Digest) {
 		return walV2Segment{}, errors.New("sealed segment footer, digest or manifest mismatch")
 	}
+	// Hash verification above binds the cache to the actual immutable bytes.
+	index, cached := loadWALV2Index(dir, file, meta, headerBytes)
+	if !cached {
+		rebuilt, count, last, err := scanWALV2Data(file, header, headerBytes, meta.DataBytes, meta.FirstSequence, nil)
+		if err != nil {
+			return walV2Segment{}, err
+		}
+		if count != meta.Records || last != meta.LastSequence {
+			return walV2Segment{}, errors.New("sealed segment record count or sequence mismatch")
+		}
+		index = rebuilt
+	}
 	if visit != nil {
 		if _, _, _, err := scanWALV2Data(file, header, headerBytes, meta.DataBytes, meta.FirstSequence, visit); err != nil {
 			return walV2Segment{}, err
 		}
 	}
-	return walV2Segment{meta: meta, headerBytes: headerBytes, index: index}, nil
+	return walV2Segment{meta: meta, headerBytes: headerBytes, index: index, indexCached: cached}, nil
 }
 
 // replayVerifiedWALV2Sealed is called only after validateAndVisit has checked
