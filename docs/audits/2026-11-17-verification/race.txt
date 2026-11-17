@@ -1,0 +1,8 @@
+ok  	github.com/sirdont0/solana-yellowstone-grpc-data-core	6.501s
+ok  	github.com/sirdont0/solana-yellowstone-grpc-data-core/cmd/corectl	2.505s
+ok  	github.com/sirdont0/solana-yellowstone-grpc-data-core/cmd/pumpfun-create	2.128s
+ok  	github.com/sirdont0/solana-yellowstone-grpc-data-core/examples/pumpfuncreate	2.163s
+ok  	github.com/sirdont0/solana-yellowstone-grpc-data-core/examples/rawconsumer	2.329s
+ok  	github.com/sirdont0/solana-yellowstone-grpc-data-core/internal/ingest	16.147s
+ok  	github.com/sirdont0/solana-yellowstone-grpc-data-core/internal/sourcecfg	2.058s
+?   	github.com/sirdont0/solana-yellowstone-grpc-data-core/proto	[no test files]

@@ -17,6 +17,7 @@ import (
 
 	"github.com/mr-tron/base58"
 	pb "github.com/sirdont0/solana-yellowstone-grpc-data-core/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -27,14 +28,17 @@ const (
 )
 
 type Config struct {
-	Logger            *slog.Logger `json:"-"`
-	SourceID          string
-	Endpoint          string
-	Token             string `json:"-"`
-	TokenHeader       string
-	Commitment        string
-	FilterVersion     string
-	Programs          []string
+	Logger        *slog.Logger `json:"-"`
+	SourceID      string
+	Endpoint      string
+	Token         string `json:"-"`
+	TokenHeader   string
+	Commitment    string
+	FilterVersion string
+	Programs      []string
+	// Subscription overrides the legacy Pump-oriented filters. Commitment and
+	// FromSlot are owned by the runner; Ping is always generated internally.
+	Subscription      *pb.SubscribeRequest
 	DataDir           string
 	Mint              string
 	TokenAccountOwner string
@@ -44,11 +48,23 @@ type Config struct {
 	PingInterval      time.Duration
 	IdleTimeout       time.Duration
 	MaxMessageBytes   int
+	QueueBytes        int64
+	BatchBytes        int64
 	ForceDropAfter    int
 	MaxReconnects     int
 	Streams           int
-	DedupeLimit       int
-	FromSlot          *uint64
+	// DedupeDisk enables an exact disk-backed index. In this mode DedupeLimit
+	// bounds only the in-memory hot cache, not the journal lifetime.
+	DedupeDisk  bool
+	DedupeLimit int
+	FromSlot    *uint64
+	// Replay rejection is terminal by default. Explicit opt-in may continue
+	// live with a durable continuity break when independent repair is planned.
+	AllowLiveFallbackOnReplayRejection bool
+	// WALVersion selects the storage container. Zero and one use the legacy
+	// single-file YLABWAL1 journal; two opts into the segmented YLABWAL2 store.
+	WALVersion      int
+	WALSegmentBytes int64
 }
 
 func FromEnv() (Config, error) {
@@ -63,6 +79,10 @@ func FromEnv() (Config, error) {
 		Mint:              strings.TrimSpace(os.Getenv("YLAB_MINT")),
 		TokenAccountOwner: val("YLAB_TOKEN_ACCOUNT_OWNER", TokenProgram),
 		RPCURL:            strings.TrimSpace(os.Getenv("YLAB_RPC_URL")),
+		QueueBytes:        128 << 20,
+		BatchBytes:        16 << 20,
+		WALVersion:        1,
+		WALSegmentBytes:   walV2DefaultSegmentBytes,
 	}
 	var err error
 	if c.RPCMaxTxVersion, err = envUint("YLAB_RPC_MAX_TX_VERSION", 1); err != nil {
@@ -84,10 +104,24 @@ func FromEnv() (Config, error) {
 	if mib, err = envUint("YLAB_MAX_MESSAGE_MIB", 64); err != nil {
 		return c, err
 	}
-	if mib == 0 || mib > 256 {
-		return c, errors.New("YLAB_MAX_MESSAGE_MIB must be 1..256")
+	if mib == 0 || mib > 95 {
+		return c, errors.New("YLAB_MAX_MESSAGE_MIB must be 1..95 so a protobuf update fits a v1 WAL frame")
 	}
 	c.MaxMessageBytes = int(mib) << 20
+	if mib, err = envUint("YLAB_QUEUE_MIB", uint64(c.QueueBytes>>20)); err != nil {
+		return c, err
+	}
+	if mib == 0 || mib > 4096 {
+		return c, errors.New("YLAB_QUEUE_MIB must be 1..4096")
+	}
+	c.QueueBytes = int64(mib) << 20
+	if mib, err = envUint("YLAB_BATCH_MIB", uint64(c.BatchBytes>>20)); err != nil {
+		return c, err
+	}
+	if mib == 0 || mib > 4096 {
+		return c, errors.New("YLAB_BATCH_MIB must be 1..4096")
+	}
+	c.BatchBytes = int64(mib) << 20
 	if c.ForceDropAfter, err = envInt("YLAB_FORCE_DROP_AFTER", 0); err != nil {
 		return c, err
 	}
@@ -100,6 +134,21 @@ func FromEnv() (Config, error) {
 	if c.DedupeLimit, err = envInt("YLAB_DEDUPE_LIMIT", 2000000); err != nil {
 		return c, err
 	}
+	if raw := strings.TrimSpace(os.Getenv("YLAB_DEDUPE_DISK")); raw != "" {
+		if c.DedupeDisk, err = strconv.ParseBool(raw); err != nil {
+			return c, fmt.Errorf("YLAB_DEDUPE_DISK: %w", err)
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("YLAB_WAL_VERSION")); raw != "" {
+		if c.WALVersion, err = strconv.Atoi(raw); err != nil {
+			return c, fmt.Errorf("YLAB_WAL_VERSION: %w", err)
+		}
+	}
+	if mib, parseErr := envUint("YLAB_WAL_SEGMENT_MIB", uint64(c.WALSegmentBytes>>20)); parseErr != nil {
+		return c, parseErr
+	} else {
+		c.WALSegmentBytes = int64(mib) << 20
+	}
 	if s := strings.TrimSpace(os.Getenv("YLAB_FROM_SLOT")); s != "" {
 		v, e := strconv.ParseUint(s, 10, 64)
 		if e != nil {
@@ -111,10 +160,33 @@ func FromEnv() (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if c.WALVersion < 0 || c.WALVersion > 2 {
+		return errors.New("WAL version must be 1 or 2")
+	}
+	if c.WALVersion == 2 {
+		segmentBytes := c.WALSegmentBytes
+		if segmentBytes == 0 {
+			segmentBytes = walV2DefaultSegmentBytes
+		}
+		if segmentBytes < 2<<20 || segmentBytes > 4<<30 || (c.BatchBytes > 0 && c.BatchBytes > segmentBytes) {
+			return errors.New("WAL v2 segment size must be 2 MiB..4 GiB and fit the configured batch")
+		}
+		// A valid gRPC update must fit even in a fresh segment. Reserve the
+		// maximum v2 record metadata, the frame/header envelopes, and the
+		// footer required when this segment is sealed. The batch writer may
+		// further limit or split groups; this is the single-message floor.
+		if c.MaxMessageBytes > 0 && c.MaxMessageBytes <= 95<<20 {
+			const segmentHeaderEnvelope = 18
+			minimum := int64(c.MaxMessageBytes) + walV2MaxHeaderBytes + walV2FramePrefixBytes + 8 + walV2MaxHeaderBytes + segmentHeaderEnvelope + walV2FooterBytes
+			if segmentBytes < minimum {
+				return fmt.Errorf("WAL v2 segment size %d cannot fit an admitted %d-byte message and WAL envelopes (need at least %d bytes)", segmentBytes, c.MaxMessageBytes, minimum)
+			}
+		}
+	}
 	if c.SourceID != "" && !regexp.MustCompile(`^[a-z][a-z0-9_-]{0,47}$`).MatchString(c.SourceID) {
 		return errors.New("source ID must be a safe lower-case name")
 	}
-	if c.Endpoint == "" || strings.TrimSpace(c.TokenHeader) == "" || c.FilterVersion == "" || c.DataDir == "" {
+	if c.Endpoint == "" || strings.TrimSpace(c.TokenHeader) == "" || c.FilterVersion == "" || len(c.FilterVersion) > 128 || c.DataDir == "" {
 		return errors.New("endpoint, token header, filter version and data dir required")
 	}
 	target := c.Endpoint
@@ -140,7 +212,7 @@ func (c Config) Validate() error {
 	if c.Commitment != "processed" && c.Commitment != "confirmed" && c.Commitment != "finalized" {
 		return fmt.Errorf("invalid commitment: %s", c.Commitment)
 	}
-	if len(c.Programs) == 0 {
+	if c.Subscription == nil && len(c.Programs) == 0 {
 		return errors.New("at least one program required")
 	}
 	for _, s := range append(append([]string{}, c.Programs...), c.Mint, c.TokenAccountOwner) {
@@ -152,6 +224,63 @@ func (c Config) Validate() error {
 			return fmt.Errorf("invalid Solana pubkey %q", s)
 		}
 	}
+	if c.MaxMessageBytes < 1 || c.MaxMessageBytes > 95<<20 {
+		return errors.New("max message bytes must be 1..95 MiB to fit the v1 WAL frame")
+	}
+	if c.QueueBytes < 0 || c.BatchBytes < 0 || (c.QueueBytes > 0 && c.QueueBytes < int64(c.MaxMessageBytes)+1024) || (c.BatchBytes > 0 && c.QueueBytes > 0 && c.BatchBytes > c.QueueBytes) {
+		return errors.New("invalid queue capacity/byte budget")
+	}
+	if c.Subscription != nil {
+		if c.Subscription.FromSlot != nil || c.Subscription.Ping != nil {
+			return errors.New("subscription must not set FromSlot or Ping; the runner owns both fields")
+		}
+		if proto.Size(c.Subscription) > 1<<20 {
+			return errors.New("custom subscription exceeds 1 MiB")
+		}
+		if len(c.Subscription.Transactions)+len(c.Subscription.TransactionsStatus)+len(c.Subscription.Accounts)+len(c.Subscription.Slots)+len(c.Subscription.BlocksMeta)+len(c.Subscription.Blocks)+len(c.Subscription.Entry)+len(c.Subscription.BlockFooter)+len(c.Subscription.AccountsDataSlice) == 0 {
+			return errors.New("custom subscription must contain at least one filter")
+		}
+		for name, filter := range c.Subscription.Transactions {
+			if name == "" || filter == nil {
+				return errors.New("custom transaction filters require nonempty names and values")
+			}
+		}
+		for name, filter := range c.Subscription.Accounts {
+			if name == "" || filter == nil {
+				return errors.New("custom account filters require nonempty names and values")
+			}
+		}
+		for name, filter := range c.Subscription.TransactionsStatus {
+			if name == "" || filter == nil {
+				return errors.New("custom transaction-status filters require nonempty names and values")
+			}
+		}
+		for name, filter := range c.Subscription.Slots {
+			if name == "" || filter == nil {
+				return errors.New("custom slot filters require nonempty names and values")
+			}
+		}
+		for name, filter := range c.Subscription.BlocksMeta {
+			if name == "" || filter == nil {
+				return errors.New("custom block-meta filters require nonempty names and values")
+			}
+		}
+		for name, filter := range c.Subscription.Blocks {
+			if name == "" || filter == nil {
+				return errors.New("custom block filters require nonempty names and values")
+			}
+		}
+		for name, filter := range c.Subscription.Entry {
+			if name == "" || filter == nil {
+				return errors.New("custom entry filters require nonempty names and values")
+			}
+		}
+		for name, filter := range c.Subscription.BlockFooter {
+			if name == "" || filter == nil {
+				return errors.New("custom block-footer filters require nonempty names and values")
+			}
+		}
+	}
 	if c.Streams < 1 || c.Streams > 2 || c.DedupeLimit < 1 || c.ForceDropAfter < 0 || c.MaxReconnects < 0 {
 		return errors.New("invalid streams/dedupe/fault configuration")
 	}
@@ -161,14 +290,35 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// Identity binds the WAL to the exact subscription shape. It excludes credentials.
+// Identity binds the WAL to the subscription profile without credentials.
+// The default subscription keeps the published v0.1.1 identity bytes, so an
+// unchanged legacy journal remains readable after upgrading. Explicit custom
+// subscriptions are additionally bound to their deterministic protobuf shape.
 func (c Config) Identity() string {
-	v := struct {
+	legacy := struct {
 		SourceID                                                     string `json:"SourceID,omitempty"`
 		Endpoint, Commitment, FilterVersion, Mint, TokenAccountOwner string
 		Programs                                                     []string
 	}{c.SourceID, c.Endpoint, c.Commitment, c.FilterVersion, c.Mint, c.TokenAccountOwner, c.Programs}
+	if c.Subscription == nil {
+		b, _ := json.Marshal(legacy)
+		return hashIdentityBytes(b)
+	}
+	subscription := SubscribeRequest(c, nil, true)
+	subscription.FromSlot = nil
+	subscription.Ping = nil
+	subscriptionBytes, _ := proto.MarshalOptions{Deterministic: true}.Marshal(subscription)
+	subscriptionHash := sha256.Sum256(subscriptionBytes)
+	v := struct {
+		SourceID                                                                   string `json:"SourceID,omitempty"`
+		Endpoint, Commitment, FilterVersion, Mint, TokenAccountOwner, Subscription string
+		Programs                                                                   []string
+	}{c.SourceID, c.Endpoint, c.Commitment, c.FilterVersion, c.Mint, c.TokenAccountOwner, hex.EncodeToString(subscriptionHash[:]), c.Programs}
 	b, _ := json.Marshal(v)
+	return hashIdentityBytes(b)
+}
+
+func hashIdentityBytes(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }

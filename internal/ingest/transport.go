@@ -22,11 +22,13 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 var errForcedDrop = errors.New("injected stream disconnect")
 var errIdle = errors.New("stream idle watchdog fired")
 var errDurableWriterFailed = errors.New("durable WAL writer failed")
+var ErrReplayRejected = errors.New("yellowstone provider rejected requested replay cursor")
 
 type Dialer func(context.Context, Config) (*grpc.ClientConn, error)
 
@@ -78,6 +80,17 @@ func auth(ctx context.Context, c Config) context.Context {
 
 func SubscribeRequest(c Config, from *uint64, withAccounts bool) *pb.SubscribeRequest {
 	commitment := c.CommitmentEnum()
+	if c.Subscription != nil {
+		p := proto.Clone(c.Subscription).(*pb.SubscribeRequest)
+		p.Commitment = &commitment
+		p.FromSlot = from
+		p.Ping = nil
+		if !withAccounts {
+			p.Accounts = nil
+			p.AccountsDataSlice = nil
+		}
+		return p
+	}
 	p := &pb.SubscribeRequest{Commitment: &commitment, FromSlot: from, Transactions: map[string]*pb.SubscribeRequestFilterTransactions{"pump": {Vote: boolp(false), Failed: boolp(false), AccountInclude: append([]string(nil), c.Programs...)}}, Slots: map[string]*pb.SubscribeRequestFilterSlots{"progress": {}}, BlocksMeta: map[string]*pb.SubscribeRequestFilterBlocksMeta{"meta": {}}}
 	if withAccounts && c.Mint != "" {
 		filter := &pb.SubscribeRequestFilterAccountsFilter{Filter: &pb.SubscribeRequestFilterAccountsFilter_Memcmp{Memcmp: &pb.SubscribeRequestFilterAccountsFilterMemcmp{Offset: 0, Data: &pb.SubscribeRequestFilterAccountsFilterMemcmp_Base58{Base58: c.Mint}}}}
@@ -91,17 +104,95 @@ func boolp(v bool) *bool { return &v }
 // guesses gaps from sparse transaction slot jumps. Stream interruption always
 // creates a durable uncertainty marker, even when replay subsequently succeeds.
 type Runner struct {
-	Config Config
-	Store  *Store
-	Dial   Dialer
-	Forced atomic.Bool
-	OnLive func(Record)
+	Config      Config
+	Store       *Store
+	QueueBudget *ByteBudget
+	Dial        Dialer
+	Forced      atomic.Bool
+	OnLive      func(Record)
 	// OnProvisional runs immediately after Recv/decode, before WAL fsync.
 	// It may observe duplicates and data lost in a crash; never treat it as verified.
-	OnProvisional func(Record)
+	OnProvisional   func(Record)
+	queueAgeMu      sync.Mutex
+	queueOldest     time.Time
+	queuePending    int
+	queueLastAge    time.Duration
+	queueMaxAge     time.Duration
+	queueAgeBuckets [8]uint64
 }
 
-func NewRunner(c Config, s *Store) *Runner { return &Runner{Config: c, Store: s, Dial: GRPCDial} }
+// WriterQueueStats measures time from receiving an update until its WAL batch
+// finishes. A failed batch is also counted: latency never implies durability.
+type WriterQueueStats struct {
+	OldestAge  time.Duration
+	LastAge    time.Duration
+	MaxAge     time.Duration
+	Pending    int
+	AgeBuckets [8]uint64 // <=1,5,10,25,50,100,500 ms, then >500 ms
+}
+
+func (r *Runner) WriterQueueStats() WriterQueueStats {
+	r.queueAgeMu.Lock()
+	defer r.queueAgeMu.Unlock()
+	s := WriterQueueStats{LastAge: r.queueLastAge, MaxAge: r.queueMaxAge, Pending: r.queuePending, AgeBuckets: r.queueAgeBuckets}
+	if !r.queueOldest.IsZero() {
+		s.OldestAge = time.Since(r.queueOldest)
+	}
+	return s
+}
+
+func (r *Runner) writerQueued(at time.Time) {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	r.queueAgeMu.Lock()
+	if r.queueOldest.IsZero() {
+		r.queueOldest = at
+	}
+	r.queuePending++
+	r.queueAgeMu.Unlock()
+}
+
+func (r *Runner) writerFlushed(batch []queuedRecord) {
+	now := time.Now()
+	thresholds := [...]time.Duration{time.Millisecond, 5 * time.Millisecond, 10 * time.Millisecond, 25 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond, 500 * time.Millisecond}
+	r.queueAgeMu.Lock()
+	for _, item := range batch {
+		at := item.receivedAt
+		if at.IsZero() {
+			at = now
+		}
+		age := now.Sub(at)
+		if age < 0 {
+			age = 0
+		}
+		r.queueLastAge = age
+		if age > r.queueMaxAge {
+			r.queueMaxAge = age
+		}
+		bucket := len(thresholds)
+		for i, limit := range thresholds {
+			if age <= limit {
+				bucket = i
+				break
+			}
+		}
+		r.queueAgeBuckets[bucket]++
+	}
+	r.queuePending -= len(batch)
+	if r.queuePending == 0 {
+		r.queueOldest = time.Time{}
+	}
+	r.queueAgeMu.Unlock()
+}
+
+func NewRunner(c Config, s *Store) *Runner {
+	queueBytes := c.QueueBytes
+	if queueBytes <= 0 {
+		queueBytes = 128 << 20
+	}
+	return &Runner{Config: c, Store: s, QueueBudget: NewByteBudget(queueBytes), Dial: GRPCDial}
+}
 
 func (r *Runner) Run(ctx context.Context) error {
 	if r.Dial == nil {
@@ -148,10 +239,8 @@ func (r *Runner) runSource(ctx context.Context, source string) error {
 		}
 		var from *uint64
 		if !disableReplay {
-			if st != nil && st.LastTxSlot > 0 {
-				// Unfiltered slot/meta progress can run ahead of filtered transactions.
-				// It is not a safe transaction replay cursor.
-				v := st.LastTxSlot
+			if frontier := replayFrontier(r.Config, st); frontier > 0 {
+				v := frontier
 				if v > r.Config.ReplayOverlap {
 					v -= r.Config.ReplayOverlap
 				} else {
@@ -159,7 +248,7 @@ func (r *Runner) runSource(ctx context.Context, source string) error {
 				}
 				from = &v
 			}
-			if (st == nil || st.LastTxSlot == 0) && r.Config.FromSlot != nil {
+			if from == nil && r.Config.FromSlot != nil {
 				v := *r.Config.FromSlot
 				from = &v
 			}
@@ -194,12 +283,18 @@ func (r *Runner) runSource(ctx context.Context, source string) error {
 			r.Config.Logger.Warn("source disconnected", "source", source, "generation", gen, "error", sanitizeErr(err, r.Config.Token))
 		}
 		if from != nil && isReplayRejection(err) {
-			disableReplay = true
-			if e := r.Store.Mark(source, gen, "replay_rejected", "provider rejected from_slot; next reconnect starts at live head"); e != nil {
+			if e := r.Store.Mark(source, gen, "replay_rejected", "provider rejected from_slot; coverage cannot be restored without an independent backfill"); e != nil {
 				return e
 			}
-		} else {
-			disableReplay = false
+			if !r.Config.AllowLiveFallbackOnReplayRejection {
+				return fmt.Errorf("%w: %w", ErrReplayRejected, err)
+			}
+			disableReplay = true
+		} else if isTerminalSubscriptionError(err) {
+			// Retrying an invalid subscription or credentials indefinitely cannot
+			// restore coverage. The durable disconnect/break markers above retain
+			// the exact uncertainty for the caller.
+			return err
 		}
 		reconnects++
 		if r.Config.MaxReconnects > 0 && reconnects >= r.Config.MaxReconnects {
@@ -212,6 +307,53 @@ func (r *Runner) runSource(ctx context.Context, source string) error {
 		case <-time.After(wait):
 		}
 	}
+}
+
+// replayFrontier returns the minimum observed slot among every update class
+// explicitly requested by a custom subscription. A class with no observed
+// slot keeps the frontier at zero: unrelated progress must never advance a
+// class whose replay position is unknown. The legacy handler subscription is
+// transaction-oriented; its optional mint-account filter also constrains it.
+func replayFrontier(c Config, st *SourceState) uint64 {
+	if st == nil {
+		return 0
+	}
+	var frontiers []uint64
+	add := func(requested bool, slot uint64) {
+		if requested {
+			frontiers = append(frontiers, slot)
+		}
+	}
+	if c.Subscription == nil {
+		// The legacy handler profile subscribes to transactions and optionally
+		// mint accounts. Its slot and block-meta updates are auxiliary signals,
+		// not independent application data classes.
+		add(true, st.LastTxSlot)
+		add(c.Mint != "", st.LastAccountSlot)
+	} else {
+		sub := c.Subscription
+		add(len(sub.Transactions) > 0, st.LastTxSlot)
+		add(len(sub.TransactionsStatus) > 0, st.LastTxStatusSlot)
+		add(len(sub.Accounts) > 0, st.LastAccountSlot)
+		add(len(sub.Slots) > 0, st.LastSlotUpdateSlot)
+		add(len(sub.BlocksMeta) > 0, st.LastMetaSlot)
+		add(len(sub.Blocks) > 0, st.LastBlockSlot)
+		add(len(sub.Entry) > 0, st.LastEntrySlot)
+		add(len(sub.BlockFooter) > 0, st.LastBlockFooterSlot)
+	}
+	if len(frontiers) == 0 {
+		return 0
+	}
+	frontier := frontiers[0]
+	for _, slot := range frontiers[1:] {
+		if slot == 0 {
+			return 0
+		}
+		if slot < frontier {
+			frontier = slot
+		}
+	}
+	return frontier
 }
 
 func (r *Runner) runOnce(parent context.Context, source string, gen uint64, from *uint64) (retErr error) {
@@ -259,7 +401,7 @@ func (r *Runner) runOnce(parent context.Context, source string, gen uint64, from
 	}
 	// Keep Recv independent of synchronous disk flush. The bounded queue gives
 	// explicit backpressure if the writer cannot keep up.
-	writeQueue, writeDone, writerStopped := r.startBatchedWriter(cancel)
+	writeQueue, writeDone, writerStopped, queueBudget := r.startBatchedWriter(cancel)
 	defer func() {
 		close(writeQueue)
 		if writeErr := <-writeDone; writeErr != nil {
@@ -301,7 +443,8 @@ func (r *Runner) runOnce(parent context.Context, source string, gen uint64, from
 			}
 			return e
 		}
-		lastRecv.Store(time.Now().UnixNano())
+		receivedAt := time.Now()
+		lastRecv.Store(receivedAt.UnixNano())
 		if u.GetPing() != nil {
 			// SubscribeUpdatePing has no ID. Allocate a client request ID; the
 			// server echoes that ID in SubscribeUpdatePong.
@@ -309,9 +452,37 @@ func (r *Runner) runOnce(parent context.Context, source string, gen uint64, from
 				return e
 			}
 		}
-		rec, e := FromUpdate(r.Config, source, gen, u)
+		// Reserve the encoded protobuf payload before FromUpdate allocates a
+		// second full-size byte slice and its envelope. This accounts for the
+		// one in-flight update per source during expensive serialization.
+		reservedBytes := int64(proto.Size(u)) + 512
+		if e = queueBudget.AcquireUntil(context.Background(), reservedBytes, writerStopped); e != nil {
+			if errors.Is(e, ErrQueueRecordTooLarge) {
+				return e
+			}
+			return errDurableWriterFailed
+		}
+		rec, e := FromUpdateAt(r.Config, source, gen, u, receivedAt)
 		if e != nil {
+			queueBudget.Release(reservedBytes)
 			return e
+		}
+		recordBytes := RecordQueueBytes(rec)
+		if recordBytes > reservedBytes {
+			_, limit := queueBudget.Snapshot()
+			if recordBytes > limit {
+				queueBudget.Release(reservedBytes)
+				return ErrQueueRecordTooLarge
+			}
+			if e = queueBudget.AcquireUntil(context.Background(), recordBytes-reservedBytes, writerStopped); e != nil {
+				queueBudget.Release(reservedBytes)
+				if errors.Is(e, ErrQueueRecordTooLarge) {
+					return e
+				}
+				return errDurableWriterFailed
+			}
+		} else if recordBytes < reservedBytes {
+			queueBudget.Release(reservedBytes - recordBytes)
 		}
 		if r.OnProvisional != nil {
 			r.OnProvisional(rec)
@@ -320,8 +491,9 @@ func (r *Runner) runOnce(parent context.Context, source string, gen uint64, from
 		// observation. The writer drains this queue before runOnce returns.
 		// A stopped writer is a fatal error, even during graceful shutdown.
 		select {
-		case writeQueue <- rec:
+		case writeQueue <- queuedRecord{record: rec, bytes: recordBytes, receivedAt: receivedAt}:
 		case <-writerStopped:
+			queueBudget.Release(recordBytes)
 			return errDurableWriterFailed
 		}
 		observed++
@@ -356,6 +528,27 @@ func sanitizeErr(err error, secrets ...string) string {
 	return message
 }
 func isReplayRejection(err error) bool {
-	c := status.Code(err)
-	return c == codes.InvalidArgument || c == codes.OutOfRange || c == codes.FailedPrecondition || c == codes.Unimplemented
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	switch st.Code() {
+	case codes.InvalidArgument, codes.OutOfRange, codes.FailedPrecondition, codes.Unimplemented:
+	default:
+		return false
+	}
+	// Invalid subscription filters can return the same status codes as an
+	// unsupported replay cursor. Preserve the cursor unless the provider's
+	// error actually identifies replay or from_slot as the cause.
+	message := strings.ToLower(st.Message())
+	return strings.Contains(message, "from_slot") || strings.Contains(message, "from slot") || strings.Contains(message, "replay")
+}
+
+func isTerminalSubscriptionError(err error) bool {
+	switch status.Code(err) {
+	case codes.InvalidArgument, codes.Unauthenticated, codes.PermissionDenied:
+		return true
+	default:
+		return false
+	}
 }

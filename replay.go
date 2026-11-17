@@ -39,7 +39,11 @@ func (e *Engine) ReplayWithOptions(ctx context.Context, opts ReplayOptions) erro
 	}()
 	for _, src := range e.cfg.Sources {
 		cfg := toLabConfig(e.cfg, src)
-		reader, err := lab.OpenWALReader(filepath.Join(cfg.DataDir, "journal.wal"))
+		walPath := filepath.Join(cfg.DataDir, "journal.wal")
+		if cfg.WALVersion == 2 {
+			walPath = filepath.Join(cfg.DataDir, "journal.v2")
+		}
+		reader, err := lab.OpenWALReader(walPath)
 		if err != nil {
 			return fmt.Errorf("core: replay source %s: %w", src.ID, err)
 		}

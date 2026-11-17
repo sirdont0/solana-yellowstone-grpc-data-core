@@ -11,6 +11,9 @@
 /tmp/
 /data/
 *.wal
+*.wal.sidx
+dedupe.db
+.dedupe-rebuild-*.db
 *.log
 *.test
 

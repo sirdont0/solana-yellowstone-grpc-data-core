@@ -234,6 +234,16 @@ func (c *MultiSourceCoordinator) Observe(o MultiSourceObservation) (MultiSourceD
 	if err := validateMultiSourceObservation(o); err != nil {
 		return result, err
 	}
+	// Only finalized observations enter the shared bank evidence model. A
+	// processed/confirmed source may legitimately report competing banks for
+	// one slot; those records remain available in its WAL as source-local raw
+	// observations and must not be merged into one slot-keyed bank.
+	if s.spec.Commitment != "finalized" {
+		switch o.Kind {
+		case MultiSourceProgress, MultiSourceBlockMeta, MultiSourceBlockFooter, MultiSourceTransaction, MultiSourceAccount, MultiSourceBankClosed, MultiSourcePartialBank:
+			return result, nil
+		}
+	}
 	if o.Kind == MultiSourceAttempt {
 		if o.Generation <= s.health.Generation {
 			return result, errors.New("connection attempt must advance generation")

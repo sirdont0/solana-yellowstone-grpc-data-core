@@ -4,6 +4,7 @@ go 1.26.11
 
 require (
 	github.com/mr-tron/base58 v1.2.0
+	go.etcd.io/bbolt v1.4.3
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
 )

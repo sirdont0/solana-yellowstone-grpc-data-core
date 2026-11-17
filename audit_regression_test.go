@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	pb "github.com/sirdont0/solana-yellowstone-grpc-data-core/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type outerHandler struct{}
@@ -275,6 +277,303 @@ func (s *auditGeyser) Subscribe(stream pb.Geyser_SubscribeServer) error {
 	<-stream.Context().Done()
 	return nil
 }
+
+func rawAccountUpdate(slot uint64) *pb.SubscribeUpdate {
+	pubkey := make([]byte, 32)
+	pubkey[0] = 9
+	owner := make([]byte, 32)
+	owner[0] = 1
+	bankID := uint64(0) // Explicit zero still has protobuf presence for this optional field.
+	return &pb.SubscribeUpdate{UpdateOneof: &pb.SubscribeUpdate_Account{Account: &pb.SubscribeUpdateAccount{
+		Account: &pb.SubscribeUpdateAccountInfo{Pubkey: pubkey, Owner: owner, Data: []byte{1, 2, 3}, WriteVersion: 7},
+		Slot:    slot, BankId: &bankID,
+	}}}
+}
+
+func rawSlotUpdate(slot uint64) *pb.SubscribeUpdate {
+	bankID := uint64(0)
+	return &pb.SubscribeUpdate{UpdateOneof: &pb.SubscribeUpdate_Slot{Slot: &pb.SubscribeUpdateSlot{Slot: slot, BankId: &bankID}}}
+}
+
+func TestRawOnlyEngineStreamsAllUpdateKindsAndDurableConsumerCursors(t *testing.T) {
+	createdAt := time.Date(2026, 11, 16, 1, 2, 3, 0, time.UTC)
+	missingCPI := makeUpdate(123, false)
+	missingCPI.GetTransaction().GetTransaction().Meta = nil
+	missingCPI.CreatedAt = timestamppb.New(createdAt)
+	failed := makeUpdate(124, true)
+	server := &auditGeyser{updates: []*pb.SubscribeUpdate{missingCPI, rawAccountUpdate(125), rawSlotUpdate(126), failed}, sent: make(chan struct{})}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grpcServer := grpc.NewServer()
+	pb.RegisterGeyserServer(grpcServer, server)
+	go grpcServer.Serve(listener)
+	defer grpcServer.Stop()
+
+	cfg := configForTest(t)
+	cfg.Sources[0].Endpoint = "grpc://" + listener.Addr().String()
+	cfg.Sources[0].Programs = nil
+	cfg.Sources[0].Subscription = &pb.SubscribeRequest{
+		Transactions: map[string]*pb.SubscribeRequestFilterTransactions{"raw-transactions": {}}, // nil Failed includes failed transactions.
+		Accounts:     map[string]*pb.SubscribeRequestFilterAccounts{"token-accounts": {Owner: []string{lab.TokenProgram}}},
+		Slots:        map[string]*pb.SubscribeRequestFilterSlots{"progress": {}},
+	}
+	cfg.ShutdownTimeout = time.Second
+	e, err := NewRaw(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+	select {
+	case <-server.sent:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("server did not send raw updates")
+	}
+
+	reader, err := e.OpenRawReader("a", RawCursor{})
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	readCtx, readCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer readCancel()
+	var updates []RawObservation
+	for len(updates) < 4 {
+		batch, nextErr := reader.Next(readCtx, 32)
+		if nextErr != nil {
+			cancel()
+			t.Fatalf("raw reader: %v", nextErr)
+		}
+		for _, observation := range batch {
+			if observation.Type == "update" {
+				updates = append(updates, observation)
+			}
+		}
+	}
+	if got := []string{updates[0].Kind, updates[1].Kind, updates[2].Kind, updates[3].Kind}; strings.Join(got, ",") != "transaction,account,slot,transaction" {
+		t.Fatalf("raw update kinds=%v", got)
+	}
+	if len(updates[0].Payload) == 0 || !updates[0].SourceCreatedAt.Equal(createdAt) || updates[0].ReceivedAt.IsZero() {
+		t.Fatalf("source timestamps/raw payload missing: %+v", updates[0])
+	}
+	if !updates[1].BankIDPresent || updates[1].BankID != 0 || !updates[2].BankIDPresent {
+		t.Fatalf("optional zero bank ID presence lost: account=%+v slot=%+v", updates[1], updates[2])
+	}
+	if !updates[3].Failed || !updates[3].StatusPresent || !updates[3].FeePresent {
+		t.Fatalf("failed transaction status/fee metadata missing: %+v", updates[3])
+	}
+	health := e.Health()["a"]
+	if health.QueueByteLimit == 0 || health.SourceQueueByteLimit == 0 || health.WALSyncCount == 0 {
+		t.Fatalf("queue byte budgets are not observable: %+v", health)
+	}
+	last := updates[3].Cursor
+	if last.Sequence == 0 || last.JournalID == "" || last.Identity == "" {
+		t.Fatalf("incomplete stable cursor: %+v", last)
+	}
+	if err := e.Ack("aggregator", last); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	acknowledged, err := e.ConsumerCursor("aggregator", "a")
+	if err != nil || acknowledged != last {
+		cancel()
+		t.Fatalf("ack cursor=%+v err=%v want=%+v", acknowledged, err, last)
+	}
+	older := last
+	older.Sequence--
+	if err := e.Ack("aggregator", older); !errors.Is(err, ErrCursorRegression) {
+		cancel()
+		t.Fatalf("backward ack err=%v", err)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("raw engine shutdown: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("raw engine did not stop")
+	}
+	var sawSessionEnd bool
+	for {
+		tail, nextErr := reader.Next(context.Background(), 32)
+		for _, observation := range tail {
+			if observation.Type == "marker" && observation.Kind == "session_end" {
+				sawSessionEnd = true
+			}
+		}
+		if errors.Is(nextErr, io.EOF) {
+			break
+		}
+		if nextErr != nil {
+			t.Fatalf("live reader failed to switch to closed WAL: %v", nextErr)
+		}
+	}
+	if !sawSessionEnd {
+		t.Fatal("live raw reader did not drain the final WAL marker after shutdown")
+	}
+	var replayedUpdates int
+	if err := e.ReadRawFromConsumer(context.Background(), "aggregator", "a", func(observation RawObservation) error {
+		if observation.Type == "update" {
+			replayedUpdates++
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if replayedUpdates != 0 {
+		t.Fatalf("acknowledged updates were redelivered: %d", replayedUpdates)
+	}
+}
+
+func TestRunDrainsAcceptedEventsAfterParentCancellation(t *testing.T) {
+	server := &auditGeyser{updates: []*pb.SubscribeUpdate{makeUpdate(201, false), makeUpdate(202, false)}, sent: make(chan struct{})}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grpcServer := grpc.NewServer()
+	pb.RegisterGeyserServer(grpcServer, server)
+	go grpcServer.Serve(listener)
+	defer grpcServer.Stop()
+	cfg := configForTest(t)
+	cfg.Sources[0].Endpoint = "grpc://" + listener.Addr().String()
+	cfg.QueueCapacity = 1
+	cfg.ShutdownTimeout = time.Second
+	parent, cancel := context.WithCancel(context.Background())
+	var events int
+	e, err := New(cfg, func(ctx context.Context, _ Event) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		events++
+		if events == 1 {
+			<-server.sent // Ensure the second update was accepted by the server before cancelling.
+			cancel()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Register(probeHandler{}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- e.Run(parent) }()
+	select {
+	case <-server.sent:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("server did not send events")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("graceful drain did not finish")
+	}
+	if events != 2 {
+		t.Fatalf("accepted sink events were lost during cancellation: got=%d want=2", events)
+	}
+}
+
+func TestRunDrainDeadlineIsReported(t *testing.T) {
+	server := &auditGeyser{updates: []*pb.SubscribeUpdate{makeUpdate(211, false)}, sent: make(chan struct{})}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grpcServer := grpc.NewServer()
+	pb.RegisterGeyserServer(grpcServer, server)
+	go grpcServer.Serve(listener)
+	defer grpcServer.Stop()
+	cfg := configForTest(t)
+	cfg.Sources[0].Endpoint = "grpc://" + listener.Addr().String()
+	cfg.ShutdownTimeout = 50 * time.Millisecond
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e, err := New(cfg, func(ctx context.Context, _ Event) error {
+		cancel()
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Register(probeHandler{}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- e.Run(parent) }()
+	select {
+	case <-server.sent:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not send event")
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrDrainTimeout) {
+			t.Fatalf("expected drain timeout, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("drain deadline did not cancel sink context")
+	}
+}
+
+func TestRunDrainDeadlineJoinsIndependentSinkError(t *testing.T) {
+	server := &auditGeyser{updates: []*pb.SubscribeUpdate{makeUpdate(212, false)}, sent: make(chan struct{})}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grpcServer := grpc.NewServer()
+	pb.RegisterGeyserServer(grpcServer, server)
+	go grpcServer.Serve(listener)
+	defer grpcServer.Stop()
+	cfg := configForTest(t)
+	cfg.Sources[0].Endpoint = "grpc://" + listener.Addr().String()
+	cfg.ShutdownTimeout = 10 * time.Millisecond
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sinkErr := errors.New("independent sink failure")
+	e, err := New(cfg, func(_ context.Context, _ Event) error {
+		cancel()
+		// Simulate a sink doing blocking work without observing cancellation.
+		time.Sleep(200 * time.Millisecond)
+		return sinkErr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Register(probeHandler{}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- e.Run(parent) }()
+	select {
+	case <-server.sent:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not send event")
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, sinkErr) || !errors.Is(err, ErrDrainTimeout) {
+			t.Fatalf("expected both sink error and drain timeout, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("blocked sink did not return")
+	}
+}
+
 func TestEngineLiveSkipPersistenceEvidenceAndDrain(t *testing.T) {
 	for _, delivery := range []DeliveryMode{Durable, Provisional} {
 		t.Run(map[DeliveryMode]string{Durable: "durable", Provisional: "provisional"}[delivery], func(t *testing.T) {

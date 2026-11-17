@@ -1,5 +1,11 @@
 # Deferred technical debt and release gates
 
+Current verification and the ordered public-Core closure checklist:
+[2026-11-17 audit](AUDIT_VERIFICATION_2026-11-17.md). It includes additional
+recovery/cursor repairs, six process-kill scenarios, an idempotent application
+database example, and measured limitations of the local WAL load fixture.
+It does not close incremental recovery, ACK-aware retention or full acceptance.
+
 [← Home](../README.md) · [Core architecture](ARCHITECTURE.md) · [Aggregator V2 roadmap](AGGREGATOR_V2_ROADMAP.md)
 
 The initial reusable Core deliberately excludes RPC/SQD recovery and archive
@@ -12,25 +18,85 @@ The current development branch now stops on fatal WAL writer/dedupe failures
 instead of repeatedly reconnecting, preserves and forwards the successfully
 fsynced prefix of a batch before a later conflict, drains received updates
 through the source writer on graceful cancellation, and rejects reuse of a
-WAL directory under an incompatible subscription identity. Regression tests
-cover the conflict prefix, terminal writer failure, cancellation boundary and
-identity rejection. These repairs **do not** add a persisted application
-delivery cursor or make the Core a canonical state engine.
+WAL directory under an incompatible subscription identity. The 2026-11-16
+working tree additionally adds raw-only subscriptions, source-local WAL tail
+cursors, durable consumer ACK files, byte budgets and bounded sink drain.
+These repairs **do not** make the Core a canonical state engine or provide an
+atomic transaction spanning an external consumer database and its ACK file.
 
-Remaining Core runtime priorities are versioned segmented binary WAL with
-v1 compatibility; indexed checkpoint/recovery; durable late-duplicate policy
-with bounded memory; byte-budgeted queues and backlog/latency metrics; and
-downstream delivery/atomic-commit acknowledgement. The current checkpoint is
-diagnostic, and startup still scans the existing WAL to rebuild dedupe state.
+Remaining raw Core runtime priorities are persistent indexed checkpoint/recovery
+and WAL retention/compaction driven by consumer ACKs. A cross-source decoded-event
+dedupe policy belongs to the optional decoded-handler layer. The public
+`rawconsumer --output-db` example demonstrates application-owned transactional
+idempotency followed by a separate Core ACK; Core does not provide a transaction
+spanning arbitrary application storage and its ACK files.
+The current checkpoint is diagnostic, startup still scans the existing WAL to
+rebuild dedupe state, and the live WAL sparse index is rebuilt on every open. Cleanly closed WALs
+now persist a best-effort `.sidx` seek cache for offline readers; the cache
+is invalidated by WAL size/mtime changes. A crash without a current cache
+still requires sequential offline catch-up.
+
+An opt-in `DedupeDisk` mode (`YLAB_DEDUPE_DISK=true` in the lab CLI) now uses a
+WAL-derived bbolt index per source. `DedupeLimit` bounds its in-memory hot
+cache; late source-local duplicates and conflicts remain discoverable after
+eviction and restart. The default RAM-only mode still stops at its lifetime
+limit. Every startup **rebuilds** the disk index from the verified full WAL,
+which has O(history) startup time and may temporarily require a second index's
+disk space. bbolt's mapped pages and WAL parsing still affect RSS; this is
+not a proven whole-process memory bound. Legacy decoded-event dispatch in
+`Engine.seen` retains its separate in-memory limit; `NewRaw` avoids that path.
+
+The [WAL v2 contract](WAL_V2_CONTRACT.md) records migration, rotation,
+crash-recovery and cursor acceptance rules. This working tree now contains an
+opt-in segmented v2 writer (`WALVersion=2`), reader and explicit v1-to-v2
+copy/verify migration CLI, with manifest-based committed offsets. Rotation,
+restart, cross-segment cursor, uncommitted-tail recovery and sealed-corruption
+behavior have focused tests. The v1 format remains the default; v2 is still
+experimental. Incremental startup/index recovery, retention, compaction,
+the full fault-injected crash matrix and
+sustained-load acceptance remain open.
+The [2026-11-16 recheck](AUDIT_FOLLOWUP_2026-11-16.md) originally reproduced
+five defects in commit recovery, legacy identity, format switching, segment
+capacity validation and sparse-index fallback. Subsequent working-tree fixes
+now pass all five original regression probes, including the injected
+post-`CURRENT`-publication failure. This closes those specific reproductions;
+the full v2 crash/fault matrix and load acceptance remain open.
 
 The [2026-11-15 follow-up](AUDIT_CLOSURE_2026-11-15.md) additionally implements
 explicit decode isolation, tolerant read-only replay, shared normalization,
 public evidence, basic health counters, structured logging and reconnect controls.
-These improve diagnostics; byte budgets, WAL queue age and latency histograms
-are still open. The experimental v0.1.1 release includes these repairs; its workflow gates
-publication on CI. The old v0.1.0 tag remains immutable.
+The 2026-11-16 working tree adds source/dispatch byte budgets and exposes their
+current usage and limits, plus last/total/max fsync duration and count.
+The source receive path now reserves `proto.Size(update)+512` queue bytes
+before `FromUpdate` allocates an encoded payload; after serialization it
+reconciles the reservation to `RecordQueueBytes`. The already-decoded gRPC
+message, protobuf scratch allocations and Go runtime overhead still mean
+these byte budgets are not exact process RSS limits.
+`Health()` now exposes current oldest shared-dispatch wait, last/max completed
+wait and pending dispatch count after byte reservation. This is not the age of
+source-WAL queue batches. Source writer age is now separately exposed through
+`SourceWriterOldestAge`, `SourceWriterLastAge`, `SourceWriterMaxAge`,
+`SourceWriterPending`, and eight histogram buckets (<=1/5/10/25/50/100/500ms,
+then >500ms). It includes local byte-budget waits and WAL batch flush time,
+but not network/provider lag and does not itself prove fsync success. Fsync
+attempt durations also have eight exclusive buckets using the same thresholds;
+failed fsync attempts count too. `ConsumerLag` now reports the oldest pending
+record age and accumulates a per-consumer/source histogram of that age whenever
+the API is sampled. The process-local histogram is bounded to 1,024 active
+consumer/source pairs and describes scrape observations of the oldest pending
+record, not the age distribution of every record in the backlog.
+`ConsumerLag(consumer, source)`
+exposes current WAL-record backlog against a durable ACK, including markers.
+Raw ACK writes now serialize across Engine instances/processes on supported
+Unix platforms; an unsupported platform fails closed. WAL batch preflight,
+failed-write rollback, damaged-tail prefix delivery, and a cursor-specific
+replay rejection classifier have regression coverage. These uncommitted changes are not part of the immutable `v0.1.1`
+tag; the old `v0.1.0` tag remains immutable as well.
 
-## Deferred recovery work
+## Optional downstream recovery work (outside raw Core acceptance)
+
+The following features require additional completeness evidence or application
+semantics. They are not mandatory parts of the universal raw ingestion API.
 
 - A verified full-block oracle for produced slots and filtered transaction
   inclusion; parent hash continuity, skipped slots, incomplete banks.
@@ -54,9 +120,10 @@ publication on CI. The old v0.1.0 tag remains immutable.
   against the actual endpoint version.
 - Pin an immutable reviewed version for the consumer; track the currently
   experimental source-release tag and the corresponding compatibility policy.
-- Integrate an opt-in Aggregator V2 adapter, compare replay fixtures, then
-  switch consumers only after acceptance. Existing V1/V2 handlers stay intact
-  until parity is proven.
+
+An Aggregator V2 adapter and its replay parity are separate downstream work.
+They are not release gates for the public raw Core; this audit does not modify
+or test that aggregator.
 
 ## Public source release status
 
@@ -68,9 +135,12 @@ pre-publication baseline and its then-open conditions.
 
 ## Remaining release and operation gates
 
-- Add a persisted downstream delivery cursor or application-owned atomic
-  acknowledgement protocol. Current `Durable` mode protects raw observations,
-  but cannot guarantee exactly-once sink effects or automatic redelivery.
+- Raw consumer ACK cursors are now persisted per source/consumer and bound to
+  the WAL journal ID. They provide at-least-once resume when the consumer
+  commits first and ACKs second. Add WAL retention/compaction based on the
+  slowest consumer, and integrate ACK with the consumer's own transaction
+  where its storage engine supports a shared atomic boundary. Current `Durable`
+  handler mode still does not guarantee exactly-once sink effects.
 - Prove live/replay equivalence for stateful consumers requiring canonical
   ordering; current source WAL replay preserves only source-local order.
 

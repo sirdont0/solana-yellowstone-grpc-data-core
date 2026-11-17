@@ -23,6 +23,108 @@ func TestSourceTokenIsNotJSONSerialized(t *testing.T) {
 	}
 }
 
+func TestPublicDedupeDiskOptionReachesSourceStore(t *testing.T) {
+	cfg := configForTest(t)
+	cfg.DedupeDisk = true
+	cfg.DedupeLimit = 3
+	e, err := NewRaw(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labCfg := toLabConfig(e.cfg, e.cfg.Sources[0])
+	if !labCfg.DedupeDisk || labCfg.DedupeLimit != 3 {
+		t.Fatalf("disk dedupe option lost before source Store: %+v", labCfg)
+	}
+}
+
+func TestMessageLimitBoundaryAndRawOnlyCustomSubscription(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mib  int
+		want bool
+	}{{"default", 0, true}, {"minimum", 1, true}, {"maximum", 95, true}, {"negative", -1, false}, {"over-limit", 96, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := configForTest(t)
+			cfg.MaxMessageMiB = tc.mib
+			_, err := New(cfg, func(context.Context, Event) error { return nil })
+			if (err == nil) != tc.want {
+				t.Fatalf("MaxMessageMiB=%d err=%v", tc.mib, err)
+			}
+		})
+	}
+
+	cfg := configForTest(t)
+	cfg.Sources[0].Programs = nil
+	cfg.Sources[0].Subscription = &pb.SubscribeRequest{
+		Transactions: map[string]*pb.SubscribeRequestFilterTransactions{"all": {}},
+		Accounts:     map[string]*pb.SubscribeRequestFilterAccounts{"token-accounts": {Owner: []string{lab.TokenProgram}}},
+	}
+	if _, err := NewRaw(cfg); err != nil {
+		t.Fatalf("raw-only custom transaction/account subscription rejected: %v", err)
+	}
+}
+
+func TestProgramHandlersRequireFinalizedCommitment(t *testing.T) {
+	cfg := configForTest(t)
+	cfg.Sources[0].Commitment = "processed"
+	e, err := New(cfg, func(context.Context, Event) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Register(probeHandler{}); err == nil {
+		t.Fatal("processed source was admitted to canonical program handlers")
+	}
+	raw, err := NewRaw(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Register(probeHandler{}); err == nil {
+		t.Fatal("raw-only engine accepted a program handler")
+	}
+}
+
+func TestConsumerCursorPersistsAcrossEngineRestartAndBindsJournal(t *testing.T) {
+	cfg := configForTest(t)
+	e1, err := NewRaw(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lc := toLabConfig(cfg, cfg.Sources[0])
+	store1, err := lab.OpenStore(lc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e1.stores["a"] = store1
+	cp := store1.Snapshot()
+	cursor := RawCursor{Source: "a", Identity: cp.Identity, JournalID: cp.JournalID, Sequence: cp.WALRecords}
+	if err := e1.Ack("aggregator", cursor); err != nil {
+		t.Fatal(err)
+	}
+	if err := store1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e2, err := NewRaw(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store2, err := lab.OpenStore(lc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e2.stores["a"] = store2
+	defer store2.Abort()
+	restored, err := e2.ConsumerCursor("aggregator", "a")
+	if err != nil || restored != cursor {
+		t.Fatalf("consumer cursor not restored after restart: got=%+v want=%+v err=%v", restored, cursor, err)
+	}
+	stale := cursor
+	stale.JournalID = "recreated-journal"
+	if err := e2.Ack("aggregator", stale); !errors.Is(err, ErrCursorExpired) {
+		t.Fatalf("stale journal cursor was accepted: %v", err)
+	}
+}
+
 const testProgram = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
 type probeHandler struct{}

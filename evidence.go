@@ -36,10 +36,35 @@ type SourceHealth struct {
 	Pongs            uint64
 	WALRecords       uint64
 	LastSeen         time.Time
+	LastTransportAt  time.Time
+	LastDataAt       time.Time
+	LastProgressAt   time.Time
 	DecodeFailures   uint64
 	// QueueDepth is the shared dispatch queue, not a coverage frontier.
-	QueueDepth    int
-	QueueCapacity int
+	QueueDepth     int
+	QueueCapacity  int
+	QueueBytes     int64
+	QueueByteLimit int64
+	// Queue wait is for shared dispatch work after byte reservation, including
+	// channel-capacity backpressure. It is repeated per-source in Health.
+	QueueOldestWait      time.Duration
+	QueueLastWait        time.Duration
+	QueueMaxWait         time.Duration
+	QueuePending         int
+	SourceQueueBytes     int64
+	SourceQueueByteLimit int64
+	// Source writer queue age runs from observation decoding until WAL batch
+	// completion. Completed samples include failed batches.
+	SourceWriterOldestAge  time.Duration
+	SourceWriterLastAge    time.Duration
+	SourceWriterMaxAge     time.Duration
+	SourceWriterPending    int
+	SourceWriterAgeBuckets [8]uint64
+	LastWALSyncDuration    time.Duration
+	TotalWALSyncDuration   time.Duration
+	MaxWALSyncDuration     time.Duration
+	WALSyncCount           uint64
+	WALSyncAgeBuckets      [8]uint64
 }
 
 // Health includes durable counters and sticky decode failures. Final counters
@@ -57,13 +82,37 @@ func (e *Engine) Health() map[string]SourceHealth {
 	e.healthMu.RUnlock()
 	e.queueMu.RLock()
 	depth, capacity := len(e.queue), cap(e.queue)
+	budget := e.queueBudget
+	sourceBudgets := make(map[string]*lab.ByteBudget, len(e.sourceQueueBudgets))
+	for source, sourceBudget := range e.sourceQueueBudgets {
+		sourceBudgets[source] = sourceBudget
+	}
+	runners := make(map[string]*lab.Runner, len(e.sourceRunners))
+	for source, runner := range e.sourceRunners {
+		runners[source] = runner
+	}
 	e.queueMu.RUnlock()
+	var queueBytes, queueByteLimit int64
+	if budget != nil {
+		queueBytes, queueByteLimit = budget.Snapshot()
+	}
+	oldestWait, lastWait, maxWait, pending := e.queueWaitSnapshot()
 	out := make(map[string]SourceHealth, len(e.cfg.Sources))
 	for _, src := range e.cfg.Sources {
-		h := SourceHealth{Quality: e.quality(src.ID), DecodeFailures: failures[src.ID], QueueDepth: depth, QueueCapacity: capacity}
+		h := SourceHealth{Quality: e.quality(src.ID), DecodeFailures: failures[src.ID], QueueDepth: depth, QueueCapacity: capacity, QueueBytes: queueBytes, QueueByteLimit: queueByteLimit, QueueOldestWait: oldestWait, QueueLastWait: lastWait, QueueMaxWait: maxWait, QueuePending: pending}
+		if sourceBudget := sourceBudgets[src.ID]; sourceBudget != nil {
+			h.SourceQueueBytes, h.SourceQueueByteLimit = sourceBudget.Snapshot()
+		}
+		if runner := runners[src.ID]; runner != nil {
+			qs := runner.WriterQueueStats()
+			h.SourceWriterOldestAge, h.SourceWriterLastAge, h.SourceWriterMaxAge = qs.OldestAge, qs.LastAge, qs.MaxAge
+			h.SourceWriterPending, h.SourceWriterAgeBuckets = qs.Pending, qs.AgeBuckets
+		}
 		h.ContinuityBroken = h.Quality == "CONTINUITY_BROKEN"
 		if store := stores[src.ID]; store != nil {
 			cp := store.Snapshot()
+			h.LastWALSyncDuration, h.TotalWALSyncDuration, h.MaxWALSyncDuration, h.WALSyncCount = store.SyncStats()
+			h.WALSyncAgeBuckets = store.SyncHistogram()
 			h.WALRecords = cp.WALRecords
 			h.ContinuityBroken = h.ContinuityBroken || cp.ContinuityBroken
 			if h.ContinuityBroken {
@@ -80,6 +129,15 @@ func (e *Engine) Health() map[string]SourceHealth {
 				h.Pongs += st.Pongs
 				if st.LastSeen.After(h.LastSeen) {
 					h.LastSeen = st.LastSeen
+				}
+				if st.LastTransportAt.After(h.LastTransportAt) {
+					h.LastTransportAt = st.LastTransportAt
+				}
+				if st.LastDataAt.After(h.LastDataAt) {
+					h.LastDataAt = st.LastDataAt
+				}
+				if st.LastProgressAt.After(h.LastProgressAt) {
+					h.LastProgressAt = st.LastProgressAt
 				}
 			}
 		}
@@ -114,7 +172,11 @@ func (e *Engine) redact(s string) string {
 			s = strings.ReplaceAll(s, src.Token, "[REDACTED]")
 		}
 	}
-	return strings.NewReplacer("\n", " ", "\r", " ").Replace(s)
+	s = strings.NewReplacer("\n", " ", "\r", " ").Replace(s)
+	if len(s) > 4096 {
+		s = s[:4096] + "...[truncated]"
+	}
+	return s
 }
 
 func (e *Engine) diagnostic(owner string, r lab.Record) {

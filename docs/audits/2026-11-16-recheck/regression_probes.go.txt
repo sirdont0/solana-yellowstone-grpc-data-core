@@ -1,0 +1,81 @@
+package ingest
+
+import (
+ "crypto/sha256"
+ "encoding/hex"
+ "encoding/json"
+ "os"
+ "path/filepath"
+ "testing"
+)
+
+func TestAuditLegacyIdentityRestart(t *testing.T) {
+ c := recoveryConfig(t)
+ v := struct {
+  SourceID string `json:"SourceID,omitempty"`
+  Endpoint, Commitment, FilterVersion, Mint, TokenAccountOwner string
+  Programs []string
+ }{c.SourceID,c.Endpoint,c.Commitment,c.FilterVersion,c.Mint,c.TokenAccountOwner,c.Programs}
+ b, _ := json.Marshal(v)
+ sum := sha256.Sum256(b)
+ w, err := OpenWAL(filepath.Join(c.DataDir,"journal.wal"),nil)
+ if err != nil {t.Fatal(err)}
+ if err := w.Append(Record{Type:"marker",Kind:"legacy",Identity:hex.EncodeToString(sum[:])}); err != nil {t.Fatal(err)}
+ if err := w.Close(); err != nil {t.Fatal(err)}
+ s, err := OpenStore(c)
+ if err != nil {t.Fatalf("unchanged legacy subscription cannot reopen: %v",err)}
+ s.Close()
+}
+
+func TestAuditFormatSwitchMustNotHideHistory(t *testing.T) {
+ c := recoveryConfig(t)
+ s, err := OpenStore(c)
+ if err != nil {t.Fatal(err)}
+ id := s.Snapshot().JournalID
+ if _,err := s.Append(Record{Type:"marker",Kind:"prior_history"}); err != nil {t.Fatal(err)}
+ if err := s.Close(); err != nil {t.Fatal(err)}
+ c.WALVersion=2
+ s,err=OpenStore(c)
+ if err != nil {return} // Refusing implicit migration is acceptable.
+ defer s.Close()
+ if s.Snapshot().JournalID!=id {t.Fatal("format switch silently starts a different journal in the same source directory")}
+}
+
+func TestAuditSegmentCapacityMustMatchAdmission(t *testing.T) {
+ c:=recoveryConfig(t)
+ c.WALVersion=2; c.WALSegmentBytes=2<<20; c.BatchBytes=1<<20; c.MaxMessageBytes=3<<20
+ if err:=c.Validate(); err!=nil {return}
+ w,err:=OpenWALV2(filepath.Join(c.DataDir,"journal.v2"),"",c.Identity(),c.WALSegmentBytes,nil)
+ if err!=nil {t.Fatal(err)}
+ defer w.Close()
+ if err:=w.Append(walV2FixtureRecord((3<<20)-1024,"admitted-size")); err!=nil {t.Fatalf("accepted configuration cannot store a payload below transport limit: %v",err)}
+}
+
+func TestAuditPublishedManifestFailureMustRemainRecoverable(t *testing.T) {
+ dir:=filepath.Join(t.TempDir(),"journal.v2")
+ w,err:=OpenWALV2(dir,"source-a","identity-a",2<<20,nil)
+ if err!=nil {t.Fatal(err)}
+ if err:=w.Append(walV2FixtureRecord(128,"first")); err!=nil {t.Fatal(err)}
+ t.Setenv("CORE_AUDIT_FAIL_AFTER_CURRENT_RENAME","1")
+ err=w.Append(walV2FixtureRecord(128,"second"))
+ if err==nil {t.Fatal("fault injection was not exercised")}
+ t.Setenv("CORE_AUDIT_FAIL_AFTER_CURRENT_RENAME","")
+ w.Close()
+ w,err=OpenWALV2(dir,"source-a","identity-a",2<<20,nil)
+ if err!=nil {t.Fatalf("post-publication rollback destroyed manifest/data consistency: %v",err)}
+ w.Close()
+}
+
+func TestAuditCorruptSparseHintMustFallBack(t *testing.T) {
+ path:=walFixture(t,walIndexStride*3+1)
+ b,err:=os.ReadFile(path+".sidx"); if err!=nil {t.Fatal(err)}
+ var cache walIndexCache
+ if err:=json.Unmarshal(b,&cache); err!=nil {t.Fatal(err)}
+ cache.Entries[1].Offset++ // Structurally valid offsets, incorrect frame boundary.
+ b,err=json.Marshal(cache); if err!=nil {t.Fatal(err)}
+ if err:=os.WriteFile(path+".sidx",b,0600); err!=nil {t.Fatal(err)}
+ r,err:=OpenWALReader(path); if err!=nil {t.Fatal(err)}
+ defer r.Close()
+ records,err:=r.ReadAfter(walIndexStride,1)
+ if err!=nil || len(records)!=1 || records[0].Sequence!=walIndexStride+1 {t.Fatalf("corrupt optional hint prevents reading valid WAL: records=%d err=%v",len(records),err)}
+}

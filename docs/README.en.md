@@ -119,6 +119,81 @@ Every event carries its source, generation, commitment, slot, signature, CPI loc
 
 WAL replay checks CRC and uses the same registered handlers. Replay preserves per-source receive order; it cannot reconstruct the original cross-provider interleaving or independently prove canonical banks. Replay fails if an expected source WAL is absent or its recorded identity differs from the current source/filter configuration. Full completeness verification and RPC recovery are deferred.
 
+### Raw-only ingestion and consumer cursors
+
+Use `core.NewRaw(config)` when the application needs the complete set of
+Yellowstone update types selected by its subscription before choosing a
+program decoder. `Source.Subscription` accepts a cloned
+`proto.SubscribeRequest`, including transaction, transaction-status, account,
+slot, block-meta, block, entry and block-footer filters. The engine overwrites commitment,
+`from_slot` and ping fields and includes the normalized filter in the WAL
+identity. For transaction filters, `Vote` and `Failed` are tri-state pointers:
+`nil` leaves the outcome unfiltered; `false` excludes that class; `true` selects
+it. The legacy Pump-oriented filter still excludes votes and failed
+transactions by default.
+
+For custom subscriptions, reconnect replay uses the minimum observed slot
+frontier across all requested update classes. If one requested class has not
+produced an observed slot, the Core does not infer its position from another
+class. It uses only an explicitly configured initial `FromSlot` or starts live
+from the provider head, and the continuity break remains visible. This does not
+prove provider retention or complete historical replay; `SubscribeReplayInfo`
+is advisory and replay behavior must be checked for each endpoint/profile.
+
+`NewRaw` writes updates without ALT/CPI decoding, so missing CPI metadata cannot
+block raw capture. `OpenRawReader(source, cursor)` tails only fsynced records
+with bounded `Next(ctx, limit)` batches. `ReadRaw` performs offline catch-up
+after the engine has stopped. Each `RawObservation` includes the protobuf
+payload re-serialized after gRPC decoding, receive time, provider `created_at`
+when present, source/slot/index/signature and optional bank-ID presence. It
+also exposes transaction failure and fee metadata when the provider supplied
+transaction metadata. This is a source-local observation feed, not a
+canonical transaction order or original wire-frame archive.
+
+Persist progress with `Ack(consumer, observation.Cursor)` only after the
+consumer's own transaction commits. ACK files are atomically replaced and
+fsynced, monotonic, and scoped by consumer and source. A crash after the
+consumer commit but before ACK causes redelivery; the contract is at-least-once.
+The cursor is bound to the subscription identity and a random WAL journal ID,
+so a cursor from a deleted/recreated WAL fails with `ErrCursorExpired`.
+Consumer ACKs do not yet drive WAL retention or compaction.
+For long-running raw capture, enable `Config.DedupeDisk = true` (or
+`YLAB_DEDUPE_DISK=true` for the lab CLI). This uses an exact, WAL-derived
+bbolt index for source-local dedupe; `DedupeLimit` becomes its hot-cache size.
+Late duplicates/conflicts survive eviction and restart. Startup still rebuilds
+the entire index from WAL and needs temporary disk space. The default RAM-only
+mode and the separate decoded-event cross-source limit are unchanged.
+`ConsumerLag(consumer, source)` reports the difference between the fsynced WAL
+head and the acknowledged sequence. It counts all WAL records, including
+quality and lifecycle markers; it is not a canonical transaction count. When
+records are pending, it also reports the oldest unacknowledged record's receive
+time and age. `AgeBuckets` accumulates one oldest-record-age sample per call
+for each consumer/source pair, using `<=1s`, `<=5s`, `<=10s`, `<=30s`, `<=1m`,
+`<=5m`, `<=1h`, and `>1h` buckets. This is a scrape-sampled histogram of the
+oldest pending record, not a scan of every pending WAL record. Samples are
+process-local, bounded to 1,024 active consumer/source pairs, and reset on
+restart; the least recently sampled pair is evicted first.
+`Health()` also reports shared dispatch queue `QueueOldestWait`, `QueueLastWait`,
+`QueueMaxWait` and `QueuePending` after byte reservation. These measurements
+exclude upstream source-WAL work and are repeated per source in Health.
+ACK read/compare/write is protected by an OS-level lock on supported Unix
+systems, including across separate Engine instances.
+On clean WAL close, a best-effort `.sidx` seek cache accelerates subsequent
+offline cursor catch-up. Readers ignore stale caches and validate WAL frames.
+
+Program handlers are accepted only for `finalized` sources. `processed` and
+`confirmed` commitments can be captured through `NewRaw`; competing forks
+remain source-local and are not merged into the finalized dedupe/bank evidence
+model. For the current defaults, source writer queues are limited to 128 MiB,
+the shared dispatch queue to 256 MiB, and fsync batches to 16 MiB. These are
+payload budgets, not a hard process-memory limit. `MaxMessageMiB` is capped at
+95 MiB to fit the base64 JSON envelope in a 128 MiB WAL v1 frame. Graceful
+shutdown allows up to 15 seconds for sink delivery; a timeout returns
+`ErrDrainTimeout` and cancels the delivery context. `Health()` exposes source
+and dispatch byte usage/limits plus last, total and maximum WAL sync duration
+and sync count; source queue age and its histogram are available in the same
+snapshot.
+
 ## Repository map
 
 - [engine.go](../engine.go), [transaction.go](../transaction.go), [replay.go](../replay.go): public Go API.

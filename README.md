@@ -19,7 +19,7 @@ Multi-source Yellowstone gRPC · crash-aware WAL · transaction/CPI decoding · 
 
 ---
 
-Solana Yellowstone gRPC Data Core receives observed Solana transactions from Yellowstone providers, persists raw updates in a per-source write-ahead log (WAL), resolves transaction and CPI positions, and forwards application-defined events through an **in-process Go API**. The included [Pump.fun CreateEvent decoder](examples/pumpfuncreate/create.go) demonstrates how to build a protocol handler.
+Solana Yellowstone gRPC Data Core receives Yellowstone updates from Solana providers, persists them in per-source write-ahead logs (WALs), and exposes both decoder-independent raw observations and optional transaction/CPI handlers through an **in-process Go API**. The included [Pump.fun CreateEvent decoder](examples/pumpfuncreate/create.go) demonstrates the protocol-specific layer.
 
 > [!IMPORTANT]
 > **Experimental v0 — observation quality is not canonical completeness.** Reconnect, WAL durability, matching providers and `finalized` commitment do **not** prove full bank or account-history coverage. Do not use this release as the sole source of exact trading balances or token state. See the [acceptance contract](docs/ARCHITECTURE.md#acceptance-status) and [open release gates](docs/TECH_DEBT.md).
@@ -31,6 +31,8 @@ Solana Yellowstone gRPC Data Core receives observed Solana transactions from Yel
 | **Independent Yellowstone sources** | Configurable providers, source identity, reconnect and continuity evidence. |
 | **Bounded ingestion** | A controlled receive path with queues and backpressure. |
 | **Crash-aware raw WAL** | Per-source append log, CRC validation and grouped `fsync`. |
+| **Raw observation API** | Live WAL tailing of transactions, failed statuses, accounts, slots and other subscribed updates without CPI decoding. |
+| **Consumer cursors** | Stable source-local WAL sequence + journal ID, with durable monotonic acknowledgements. |
 | **Transaction + CPI positions** | Loaded address table (ALT) resolution and stable outer/inner instruction indices. |
 | **Pluggable decoders** | Register `Handler` implementations and deliver events to a `Sink` in the same process. |
 | **Durable replay** | Reprocess persisted raw updates through the same decoder handlers. |
@@ -46,12 +48,14 @@ flowchart LR
     subgraph C["Go Data Core"]
         I["Per-source receive<br/>and reconnect"]
         W[("CRC WAL<br/>batch fsync")]
+        R["Raw WAL reader<br/>source-local cursor"]
         D["Normalize transaction<br/>ALT + outer / inner CPI"]
         H["Registered handlers"]
     end
     A --> I
     B --> I
     I --> W
+    W --> R --> RO["Raw consumer<br/>aggregator / indexer"]
     I -. "Provisional mode" .-> D
     W -- "Durable mode" --> D
     W -- "Offline replay" --> D
@@ -90,6 +94,30 @@ CORE_REPLAY_ONLY=1 go run ./cmd/pumpfun-create
 
 The example writes raw data under `run/`; the directory is Git-ignored. The `.env` file must be loaded into your shell (or injected by your process manager). Replay requires WAL already captured with matching source/filter identity. [Read the complete setup guide →](docs/README.en.md#quick-start)
 
+### Universal raw capture (without a Pump.fun decoder)
+
+For a decoder-independent feed, `corectl` captures any supported Yellowstone
+`SubscribeRequest` filter directly into a source-local WAL:
+
+```bash
+export YELLOWSTONE_ENDPOINT='your-yellowstone-host:443'
+export YELLOWSTONE_TOKEN='your-provider-token' # only if required by the provider
+export PROGRAM_ID='a-valid-Solana-program-public-key'
+
+go run ./cmd/corectl capture \
+  --endpoint "$YELLOWSTONE_ENDPOINT" \
+  --program "$PROGRAM_ID" \
+  --source-id primary \
+  --data-dir ./raw-run
+```
+
+Use `--subscription ./subscription.json` for transaction-status, account, slot,
+block-meta, block, entry, block-footer or mixed filters; use `--config ./capture.json --dry-run` to
+validate a multi-source configuration without connecting. After stopping the
+writer, inspect or verify the WAL with `corectl inspect` and `corectl verify`.
+The [raw capture quick start](docs/RAW_QUICKSTART.md) and [CLI reference](docs/CLI.md)
+cover subscription JSON, credentials, consumer cursors, replay and migration.
+
 ## Delivery and guarantees
 
 | | Provisional | Durable | Offline replay |
@@ -101,7 +129,7 @@ The example writes raw data under `run/`; the directory is Git-ignored. The `.en
 
 Filtered slot sequences can legitimately skip numbers. In particular, `101 → 103 → 109` is **not sufficient** evidence of missing data. See [invariants and quality semantics](docs/ARCHITECTURE.md#invariants).
 
-**Delivery limit:** a synced WAL does not mean that the application's `Sink` committed every event. The public API has no persisted downstream acknowledgement cursor or atomic multi-event sink transaction. On recovery, consumers must replay and deduplicate by stable event ID; exactly-once application effects and cross-source replay order are not guaranteed. Missing/unrecorded CPI metadata stops processing by default. Opt-in `SkipAndFlag` skips the whole transaction with durable diagnostics and degraded quality; known-empty CPI is accepted. See the [audit fixes and verification](docs/AUDIT_CLOSURE_2026-11-15.md).
+**Delivery limit:** raw consumers can tail a source WAL and persist a monotonic acknowledgement cursor bound to its subscription identity and journal ID. Commit application effects first, then call `Ack`; a crash between those operations causes at-least-once redelivery. The cursor is not atomically committed with an external database transaction, and it does not establish cross-source order or canonical bank completeness. Program handlers require `finalized`; `processed` and `confirmed` are available as source-local raw observations. The raw-only mode does not require CPI metadata. See the [2026-11-16 audit follow-up](docs/AUDIT_FOLLOWUP_2026-11-16.md).
 
 ## Documentation
 
@@ -112,9 +140,11 @@ Filtered slot sequences can legitimately skip numbers. In particular, `101 → 1
 | [Aggregator V2 Go/Rust roadmap](docs/AGGREGATOR_V2_ROADMAP.md) · [Русский](docs/AGGREGATOR_V2_ROADMAP.ru.md) | Go-first decision, language-neutral boundary, lifecycle, correctness and performance gates |
 | [Technical debt / release gates](docs/TECH_DEBT.md) | Full-bank verification, account completeness, RPC/SQD recovery and load acceptance |
 | [Audit fixes, 2026-11-15](docs/AUDIT_CLOSURE_2026-11-15.md) | Finding dispositions, regression evidence and remaining release gates |
+| [Audit follow-up, 2026-11-16](docs/AUDIT_FOLLOWUP_2026-11-16.md) | Raw subscriptions, cursors/ACK, bounded shutdown, byte budgets and remaining work |
 | [Public release audit](docs/PUBLIC_RELEASE_AUDIT_2026-11-14.md) | Verified hardening and remaining release conditions |
 | [Contributing](CONTRIBUTING.md) | Local development, tests, PR conventions and decoder rules |
 | [Security policy](SECURITY.md) | Responsible disclosure, secrets and data-integrity risks |
+| [Raw capture quick start](docs/RAW_QUICKSTART.md) · [CLI reference](docs/CLI.md) | Universal Yellowstone capture, custom filters, multi-source configs and offline WAL tools |
 | [Support](SUPPORT.md) · [Code of Conduct](CODE_OF_CONDUCT.md) | Troubleshooting and community expectations |
 | [Protocol provenance](PROTO_NOTICE.md) · [Third-party notices](THIRD_PARTY_NOTICES.md) | Origin and licensing of adapted Yellowstone protobuf |
 
@@ -122,12 +152,15 @@ Filtered slot sequences can legitimately skip numbers. In particular, `101 → 1
 
 ```text
 solana-yellowstone-grpc-data-core/
-├── engine.go, transaction.go, replay.go    # Public Go API
+├── engine.go, raw.go, raw_archive.go       # Public Go API and raw consumers
+├── transaction.go, replay.go               # Decode and replay API
 ├── internal/ingest/                       # Transport, WAL, source evidence
 ├── internal/sourcecfg/                    # Provider configuration
 ├── proto/                                 # Namespaced Yellowstone protobuf
 ├── examples/pumpfuncreate/                # Pluggable sample decoder
-├── cmd/pumpfun-create/                     # Runnable demonstration
+├── examples/rawconsumer/                  # Durable raw consumer example
+├── cmd/corectl/                            # Universal capture and WAL CLI
+├── cmd/pumpfun-create/                     # Runnable decoder demonstration
 ├── docs/                                   # Architecture and guides
 └── .github/                                # CI, issue and PR templates
 ```

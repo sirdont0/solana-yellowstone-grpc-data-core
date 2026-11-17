@@ -364,6 +364,7 @@ func TestReplayRejectedFallsBackToHeadWithBreakMarker(t *testing.T) {
 	}}
 	c := integrationConfig(t, loopbackGeyser(t, s))
 	c.FromSlot = &from
+	c.AllowLiveFallbackOnReplayRejection = true
 	got := driveRunner(t, c, func(rec Record, _ []Record) bool { return rec.Kind == "transaction" })
 	reqs := s.recordedRequests()
 	if len(reqs) < 2 || reqs[0].FromSlot == nil || reqs[0].GetFromSlot() != from || reqs[1].FromSlot != nil {
@@ -371,6 +372,116 @@ func TestReplayRejectedFallsBackToHeadWithBreakMarker(t *testing.T) {
 	}
 	if !got.checkpoint.ContinuityBroken || !hasMarker(got.wal, "replay_rejected") {
 		t.Fatal("replay rejection must persist a continuity break")
+	}
+}
+
+func TestReplayRejectionFailsClosedByDefault(t *testing.T) {
+	from := uint64(650)
+	s := &scriptedGeyser{onSubscribe: func(_ int, _ *pb.SubscribeRequest, _ pb.Geyser_SubscribeServer) error {
+		return status.Error(codes.InvalidArgument, "from_slot unsupported for subscription")
+	}}
+	c := integrationConfig(t, loopbackGeyser(t, s))
+	c.FromSlot = &from
+	store, err := OpenStore(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Abort()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := NewRunner(c, store).Run(ctx); !errors.Is(err, ErrReplayRejected) {
+		t.Fatalf("unsupported replay should be terminal by default: %v", err)
+	}
+	requests := s.recordedRequests()
+	if len(requests) != 1 || requests[0].FromSlot == nil || requests[0].GetFromSlot() != from {
+		t.Fatalf("unexpected silent live fallback: %+v", requests)
+	}
+	records, err := store.ReadAfter(0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasMarker(records, "replay_rejected") || !store.Snapshot().ContinuityBroken {
+		t.Fatal("terminal replay rejection did not persist gap evidence")
+	}
+}
+
+func TestReplayRejectionRemainsDisabledAfterAnotherDisconnect(t *testing.T) {
+	from := uint64(650)
+	s := &scriptedGeyser{onSubscribe: func(n int, req *pb.SubscribeRequest, stream pb.Geyser_SubscribeServer) error {
+		switch n {
+		case 1:
+			return status.Error(codes.InvalidArgument, "from_slot unsupported for finalized")
+		case 2:
+			if req.FromSlot != nil {
+				return status.Error(codes.InvalidArgument, "second attempt must use live head")
+			}
+			if err := stream.Send(txUpdate(700, 1)); err != nil {
+				return err
+			}
+			return status.Error(codes.Unavailable, "second stream disconnected")
+		default:
+			if req.FromSlot != nil {
+				return status.Error(codes.InvalidArgument, "third attempt must retain live-head fallback")
+			}
+			if err := stream.Send(txUpdate(701, 2)); err != nil {
+				return err
+			}
+			<-stream.Context().Done()
+			return nil
+		}
+	}}
+	c := integrationConfig(t, loopbackGeyser(t, s))
+	c.FromSlot = &from
+	c.AllowLiveFallbackOnReplayRejection = true
+	got := driveRunner(t, c, func(_ Record, records []Record) bool {
+		transactions := 0
+		for _, record := range records {
+			if record.Kind == "transaction" {
+				transactions++
+			}
+		}
+		return transactions == 2
+	})
+	reqs := s.recordedRequests()
+	if len(reqs) < 3 || reqs[0].FromSlot == nil || reqs[1].FromSlot != nil || reqs[2].FromSlot != nil {
+		t.Fatalf("replay capability was incorrectly retried after live disconnect: %+v", reqs)
+	}
+	if !got.checkpoint.ContinuityBroken || !hasMarker(got.wal, "replay_rejected") {
+		t.Fatal("replay rejection and subsequent uncertainty were not persisted")
+	}
+}
+
+func TestMalformedFilterDoesNotDisableReplayCursor(t *testing.T) {
+	from := uint64(650)
+	s := &scriptedGeyser{onSubscribe: func(_ int, _ *pb.SubscribeRequest, _ pb.Geyser_SubscribeServer) error {
+		return status.Error(codes.InvalidArgument, "invalid transaction filter: account_include is malformed")
+	}}
+	c := integrationConfig(t, loopbackGeyser(t, s))
+	c.FromSlot = &from
+	store, err := OpenStore(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Abort()
+	runner := NewRunner(c, store)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	if err := runner.Run(ctx); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected terminal invalid filter failure, got %v", err)
+	}
+	reqs := s.recordedRequests()
+	if len(reqs) != 1 || reqs[0].FromSlot == nil || reqs[0].GetFromSlot() != from {
+		t.Fatalf("malformed filter disabled the replay cursor: %+v", reqs)
+	}
+	if got := store.Snapshot(); !got.ContinuityBroken {
+		t.Fatal("rejected subscription must still degrade continuity")
+	}
+	records, err := store.ReadAfter(0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasMarker(records, "replay_rejected") {
+		t.Fatal("malformed filter was misreported as provider replay rejection")
 	}
 }
 
@@ -544,9 +655,15 @@ func TestSubscriptionRequestShapeAndFilterIdentity(t *testing.T) {
 
 func TestReplayErrorClassifier(t *testing.T) {
 	for _, code := range []codes.Code{codes.InvalidArgument, codes.OutOfRange, codes.FailedPrecondition, codes.Unimplemented} {
-		if !isReplayRejection(status.Error(code, "fault")) {
-			t.Errorf("%s should disable replay on next reconnect", code)
+		if !isReplayRejection(status.Error(code, "from_slot unsupported for selected commitment")) {
+			t.Errorf("%s should disable replay when cursor is explicitly rejected", code)
 		}
+		if isReplayRejection(status.Error(code, "invalid transaction filter: account_include is malformed")) {
+			t.Errorf("%s must not mistake a malformed filter for a replay rejection", code)
+		}
+	}
+	if !isReplayRejection(status.Error(codes.OutOfRange, "replay buffer starts at slot 100")) {
+		t.Error("provider replay retention error should be classified")
 	}
 	if isReplayRejection(status.Error(codes.Unavailable, "network")) || isReplayRejection(errors.New("plain error")) || strings.Contains(sanitizeErr(errors.New("secret\nnext")), "\n") {
 		t.Fatal("network errors must remain retryable; error markers must be single-line")
