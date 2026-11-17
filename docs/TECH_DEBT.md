@@ -6,6 +6,12 @@ recovery/cursor repairs, six process-kill scenarios, an idempotent application
 database example, and measured limitations of the local WAL load fixture.
 It does not close incremental recovery, ACK-aware retention or full acceptance.
 
+Follow-up on `dev`: [verified recovery cache](RECOVERY_CHECKPOINT.md) reuses
+state and unchanged disk dedupe after a verified WAL v2 checkpoint and applies
+the remaining tail. General crash-time incremental recovery is still open:
+changed indexes rebuild, full WAL hashing remains, and historical observers
+still replay history. This cache cannot authorize retention.
+
 [← Home](../README.md) · [Core architecture](ARCHITECTURE.md) · [Aggregator V2 roadmap](AGGREGATOR_V2_ROADMAP.md)
 
 The initial reusable Core deliberately excludes RPC/SQD recovery and archive
@@ -30,8 +36,9 @@ dedupe policy belongs to the optional decoded-handler layer. The public
 `rawconsumer --output-db` example demonstrates application-owned transactional
 idempotency followed by a separate Core ACK; Core does not provide a transaction
 spanning arbitrary application storage and its ACK files.
-The current checkpoint is diagnostic, startup still scans the existing WAL to
-rebuild dedupe state, and the live WAL sparse index is rebuilt on every open. Cleanly closed WALs
+The legacy checkpoint is diagnostic. WAL v2 now has a separate verified
+state/dedupe recovery cache and persistent sealed seek indexes; neither permits
+history deletion or removes full integrity hashing. Cleanly closed v1 WALs
 now persist a best-effort `.sidx` seek cache for offline readers; the cache
 is invalidated by WAL size/mtime changes. A crash without a current cache
 still requires sequential offline catch-up.
@@ -40,9 +47,10 @@ An opt-in `DedupeDisk` mode (`YLAB_DEDUPE_DISK=true` in the lab CLI) now uses a
 WAL-derived bbolt index per source. `DedupeLimit` bounds its in-memory hot
 cache; late source-local duplicates and conflicts remain discoverable after
 eviction and restart. The default RAM-only mode still stops at its lifetime
-limit. Every startup **rebuilds** the disk index from the verified full WAL,
-which has O(history) startup time and may temporarily require a second index's
-disk space. bbolt's mapped pages and WAL parsing still affect RSS; this is
+limit. v1 and v2 without an admissible recovery cache **rebuild** the disk index
+from the verified full WAL, with O(history) work and temporary space for a second
+index. v2 can reuse the unchanged database bound to a verified snapshot;
+changed databases still rebuild. bbolt's mapped pages and WAL parsing affect RSS; this is
 not a proven whole-process memory bound. Legacy decoded-event dispatch in
 `Engine.seen` retains its separate in-memory limit; `NewRaw` avoids that path.
 

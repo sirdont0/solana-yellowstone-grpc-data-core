@@ -63,21 +63,22 @@ type Checkpoint struct {
 }
 
 type Store struct {
-	mu         sync.Mutex
-	wal        *WAL
-	dir        string
-	cfg        Config
-	cp         Checkpoint
-	dedupe     map[string]string
-	diskDedupe *diskDedupe
-	hotKeys    []string
-	hotNext    int
-	indexErr   error
-	lastRecord Record
-	journalID  string
-	onDurable  func(Record) error
-	changed    chan struct{}
-	closed     bool
+	mu                  sync.Mutex
+	wal                 *WAL
+	dir                 string
+	cfg                 Config
+	cp                  Checkpoint
+	dedupe              map[string]string
+	diskDedupe          *diskDedupe
+	hotKeys             []string
+	hotNext             int
+	indexErr            error
+	lastRecord          Record
+	recoveredCheckpoint uint64
+	journalID           string
+	onDurable           func(Record) error
+	changed             chan struct{}
+	closed              bool
 }
 
 // SetDurableObserver installs a synchronous callback after each WAL append.
@@ -161,12 +162,27 @@ func openStoreObservedLocked(c Config, observer func(Record) error) (*Store, err
 		return nil, err
 	}
 	s := &Store{onDurable: observer, cfg: c, dir: c.DataDir, dedupe: make(map[string]string), changed: make(chan struct{}), cp: Checkpoint{Schema: 1, Identity: c.Identity(), FilterVersion: c.FilterVersion, Commitment: c.Commitment, Quality: "OBSERVING_UNVERIFIED", Sources: make(map[string]*SourceState)}}
-	if c.DedupeDisk {
+	var verifiedWAL *WAL
+	if c.DedupeDisk && c.WALVersion == 2 {
+		if c.DedupeLimit < 1 {
+			return nil, errors.New("disk dedupe hot-cache limit must be positive")
+		}
+		var err error
+		verifiedWAL, err = OpenWALV2(filepath.Join(c.DataDir, "journal.v2"), c.SourceID, c.Identity(), c.WALSegmentBytes, nil)
+		if err != nil {
+			return nil, err
+		}
+		s.restoreRecoveryCheckpoint(verifiedWAL)
+	}
+	if c.DedupeDisk && s.diskDedupe == nil {
 		if c.DedupeLimit < 1 {
 			return nil, errors.New("disk dedupe hot-cache limit must be positive")
 		}
 		index, err := openDiskDedupeForReplay(c.DataDir)
 		if err != nil {
+			if verifiedWAL != nil {
+				_ = verifiedWAL.Close()
+			}
 			return nil, fmt.Errorf("open disk dedupe rebuild index: %w", err)
 		}
 		s.diskDedupe = index
@@ -177,6 +193,13 @@ func openStoreObservedLocked(c Config, observer func(Record) error) (*Store, err
 		walPath = filepath.Join(c.DataDir, "journal.v2")
 	}
 	visit := func(r Record) error {
+		if r.Sequence <= s.recoveredCheckpoint && s.recoveredCheckpoint != 0 {
+			if observer != nil {
+				return observer(r)
+			}
+			return nil
+		}
+
 		if r.Identity != "" {
 			if r.Identity != c.Identity() {
 				return errors.New("WAL subscription identity differs from configuration; use a new DataDir or migrate the old journal")
@@ -206,12 +229,41 @@ func openStoreObservedLocked(c Config, observer func(Record) error) (*Store, err
 	}
 	var w *WAL
 	var e error
-	if c.WALVersion == 2 {
+	if verifiedWAL != nil {
+		w = verifiedWAL
+		sequence := s.recoveredCheckpoint
+		if observer != nil {
+			sequence = 0
+		}
+		for sequence < w.Count() {
+			var page []Record
+			page, e = w.ReadAfter(sequence, maxWALReadBatchRecords)
+			if e != nil {
+				break
+			}
+			if len(page) == 0 {
+				e = errors.New("WAL ended before recovery frontier")
+				break
+			}
+			for _, r := range page {
+				if e = visit(r); e != nil {
+					break
+				}
+				sequence = r.Sequence
+			}
+			if e != nil {
+				break
+			}
+		}
+	} else if c.WALVersion == 2 {
 		w, e = OpenWALV2(walPath, c.SourceID, c.Identity(), c.WALSegmentBytes, visit)
 	} else {
 		w, e = OpenWAL(walPath, visit)
 	}
 	if e != nil {
+		if verifiedWAL != nil {
+			_ = verifiedWAL.Close()
+		}
 		_ = s.diskDedupe.close()
 		return nil, e
 	}
@@ -720,6 +772,7 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	s.closed = true
 	s.signalChanged()
+	_ = s.saveRecoveryCheckpointLocked()
 	w := s.wal.Close()
 	index := s.diskDedupe.close()
 	s.mu.Unlock()

@@ -1,0 +1,8 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/sirdont0/solana-yellowstone-grpc-data-core/internal/ingest
+cpu: Apple M4 Pro
+BenchmarkWALV2StoreRecovery/full_rebuild-14         	       3	 138968903 ns/op	54445821 B/op	  523671 allocs/op
+BenchmarkWALV2StoreRecovery/verified_snapshot-14    	       3	  57631333 ns/op	12554277 B/op	  108627 allocs/op
+PASS
+ok  	github.com/sirdont0/solana-yellowstone-grpc-data-core/internal/ingest	7.093s

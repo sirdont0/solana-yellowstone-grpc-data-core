@@ -21,9 +21,17 @@ func TestWALV2SyntheticLoad(t *testing.T) {
 	if os.Getenv("CORE_WAL_LOAD") != "1" {
 		t.Skip("set CORE_WAL_LOAD=1 for local 1x/3x/10x WAL experiment")
 	}
+	seconds := 5
+	if value := os.Getenv("CORE_WAL_LOAD_SECONDS"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 || parsed > 300 {
+			t.Fatal("CORE_WAL_LOAD_SECONDS must be 1..300 (offered duration per profile; draining may take longer)")
+		}
+		seconds = parsed
+	}
 	for _, rate := range []int{1000, 3000, 10000} {
 		t.Run(fmt.Sprintf("offered_%d_records_per_second", rate), func(t *testing.T) {
-			const seconds, batchSize = 5, 64
+			const batchSize = 64
 			count := rate * seconds
 			dir := filepath.Join(t.TempDir(), "journal.v2")
 			w, err := OpenWALV2(dir, "source-a", "identity-a", 2<<20, nil)

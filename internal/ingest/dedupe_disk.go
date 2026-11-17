@@ -18,9 +18,9 @@ const (
 var dedupeBucket = []byte("exact_dedupe_v1")
 
 // diskDedupe is a derived index: the WAL is the only authority for membership.
-// Every startup builds a fresh database from WAL's CRC/sequence-validated
-// records before replacing the previous database. A crash can therefore leave
-// an index either behind or ahead of WAL without changing recovery semantics.
+// Startup either restores an unchanged database bound to a verified recovery
+// checkpoint, or builds a fresh database from validated WAL records. An index
+// with a different digest is never paired with an older checkpoint.
 type diskDedupe struct {
 	db          *bolt.DB
 	path        string
@@ -134,6 +134,10 @@ func (d *diskDedupe) putBatch(entries map[string]string) error {
 func (d *diskDedupe) finishReplay() error {
 	if err := d.flushReplay(); err != nil {
 		return err
+	}
+	if d.rebuildPath == "" {
+		d.pending = nil
+		return nil
 	}
 	if err := d.db.Close(); err != nil {
 		d.db = nil

@@ -40,8 +40,10 @@ model.
 The current opt-in implementation uses `data_dir/source/journal.v2/` with
 `CURRENT`, `manifests/`, `segments/` and optional `indexes/`. Verified writer
 reopens persist sealed seek indexes. Offline readers use but never write these
-caches. The structure below remains an extended target: durable recovery
-checkpoints and incremental dedupe recovery are not yet built.
+caches. A separate [verified recovery cache](RECOVERY_CHECKPOINT.md) can now
+restore Store state and an unchanged dedupe database and apply the remaining
+tail. Authoritative retention checkpoints and general crash-time incremental
+dedupe recovery remain unimplemented.
 
 ```
 data_dir/source/

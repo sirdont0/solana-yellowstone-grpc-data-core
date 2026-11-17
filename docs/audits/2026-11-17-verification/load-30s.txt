@@ -1,0 +1,30 @@
+=== RUN   TestWALV2SyntheticLoad
+=== RUN   TestWALV2SyntheticLoad/offered_1000_records_per_second
+    wal_v2_load_test.go:125: records=30000 elapsed=30.034524542s achieved_records_per_second=998.9 append_p95=37.066959ms append_p99=74.323416ms max_schedule_lag=84.507333ms peak_sampled_heap_bytes=3768704 verified_recovery=349.272625ms
+=== RUN   TestWALV2SyntheticLoad/offered_3000_records_per_second
+    wal_v2_load_test.go:125: records=90000 elapsed=46.026360542s achieved_records_per_second=1955.4 append_p95=39.047833ms append_p99=74.965875ms max_schedule_lag=16.026278333s peak_sampled_heap_bytes=3812168 verified_recovery=1.120424958s
+=== RUN   TestWALV2SyntheticLoad/offered_10000_records_per_second
+    wal_v2_load_test.go:125: records=300000 elapsed=2m36.181892s achieved_records_per_second=1920.8 append_p95=44.971291ms append_p99=74.951208ms max_schedule_lag=2m6.181812791s peak_sampled_heap_bytes=3884976 verified_recovery=3.467897041s
+--- PASS: TestWALV2SyntheticLoad (237.34s)
+    --- PASS: TestWALV2SyntheticLoad/offered_1000_records_per_second (30.42s)
+    --- PASS: TestWALV2SyntheticLoad/offered_3000_records_per_second (47.20s)
+    --- PASS: TestWALV2SyntheticLoad/offered_10000_records_per_second (159.72s)
+PASS
+      238.30 real        12.70 user        27.73 sys
+            28049408  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                2030  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+               25168  signals received
+              150538  voluntary context switches
+              267978  involuntary context switches
+        163831657854  instructions retired
+         87741902894  cycles elapsed
+            17826464  peak memory footprint
