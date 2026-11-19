@@ -1,7 +1,5 @@
 # Aggregator V2 integration roadmap — Go first, Rust optional
 
-> **Scope note (2026-11-19):** This is a downstream Aggregator V2 design and uses historical `v0.1.0` comparisons. The current standalone public Core plan, accepted boundaries, provider matrix and release gates live in [PROJECT_SCOPE.md](PROJECT_SCOPE.md), [ROADMAP.md](ROADMAP.md), [PROVIDER_MATRIX.md](PROVIDER_MATRIX.md) and [RELEASE_GATES.md](RELEASE_GATES.md). Do not treat this downstream roadmap as an implemented Core capability.
-
 [← Home](../README.md) · [Русская версия](AGGREGATOR_V2_ROADMAP.ru.md) · [Core architecture](ARCHITECTURE.md) · [Technical debt](TECH_DEBT.md)
 
 **Decision date:** 2026-11-14

@@ -1,7 +1,5 @@
 # Architecture and acceptance contract
 
-> **Scope navigation (2026-11-19):** Accepted product boundaries and four ADRs are in [PROJECT_SCOPE.md](PROJECT_SCOPE.md), source/cursor semantics in [SOURCE_CONTRACT.md](SOURCE_CONTRACT.md), provider compatibility in [PROVIDER_MATRIX.md](PROVIDER_MATRIX.md), downstream test/SLO expectations in [CONSUMER_ACCEPTANCE_AND_SLO.md](CONSUMER_ACCEPTANCE_AND_SLO.md), and current acceptance gates in [RELEASE_GATES.md](RELEASE_GATES.md). This document describes the implementation and invariants; the extra documents distinguish present features from future acceptance.
-
 [← Home](../README.md) · [🇬🇧 English](README.en.md) · [🇷🇺 Русский](README.ru.md) · [Aggregator V2 roadmap](AGGREGATOR_V2_ROADMAP.md) · [Technical debt](TECH_DEBT.md)
 
 The goal is a reusable Solana event foundation consumed as a Go library by

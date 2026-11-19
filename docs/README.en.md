@@ -1,6 +1,6 @@
 # Solana Yellowstone gRPC Data Core — English
 
-[← Home](../README.md) · [🇬🇧 English](README.en.md) · [🇷🇺 Русский](README.ru.md) · [Architecture](ARCHITECTURE.md) · [Core scope/ADRs](PROJECT_SCOPE.md) · [Acceptance/SLO](CONSUMER_ACCEPTANCE_AND_SLO.md) · [Core roadmap](ROADMAP.md) · [Aggregator V2 roadmap](AGGREGATOR_V2_ROADMAP.md) · [Technical debt](TECH_DEBT.md) · [Contributing](../CONTRIBUTING.md) · [Security](../SECURITY.md)
+[← Home](../README.md) · [🇬🇧 English](README.en.md) · [🇷🇺 Русский](README.ru.md) · [Architecture](ARCHITECTURE.md) · [Aggregator V2 roadmap](AGGREGATOR_V2_ROADMAP.md) · [Technical debt](TECH_DEBT.md) · [Contributing](../CONTRIBUTING.md) · [Security](../SECURITY.md)
 
 ## Overview
 
@@ -11,8 +11,6 @@ Solana Yellowstone gRPC Data Core is an embeddable Go library for processing obs
 **What is outside this library:** token holder accounting, liquidity/price models, wallet execution, ML features and automatic RPC/SQD recovery. The existing Aggregator V2 application retains these application-specific concerns.
 
 **Current status:** experimental v0. Sources are observations, even at finalized commitment. Core cannot yet certify complete banks or account/config history. Quality remains OBSERVING_UNVERIFIED or CONTINUITY_BROKEN.
-
-**Agreed planning contracts (2026-11-19, Russian):** [product boundaries and ADRs](PROJECT_SCOPE.md), [source/raw consumer API](SOURCE_CONTRACT.md), [provider probes](PROVIDER_MATRIX.md), [downstream test and SLO profile](CONSUMER_ACCEPTANCE_AND_SLO.md), [Core task roadmap](ROADMAP.md), [release gates](RELEASE_GATES.md), and [upstream references](REFERENCES.md). The numeric SLO targets are provisional planning assumptions, not measured service guarantees.
 
 ## Quick start
 

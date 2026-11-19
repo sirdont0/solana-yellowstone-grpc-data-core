@@ -18,3 +18,14 @@ dedupe.db
 *.test
 
 /coverage.out
+
+# Local planning and audit evidence (keep on disk, outside Git)
+/docs/ADR/
+/docs/audits/2026-11-19-*/
+/docs/CONSUMER_ACCEPTANCE_AND_SLO.md
+/docs/PROJECT_SCOPE.md
+/docs/PROVIDER_MATRIX.md
+/docs/REFERENCES.md
+/docs/RELEASE_GATES.md
+/docs/ROADMAP.md
+/docs/SOURCE_CONTRACT.md
