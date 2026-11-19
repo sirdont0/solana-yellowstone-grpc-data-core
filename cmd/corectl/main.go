@@ -12,6 +12,7 @@ const usage = `corectl — Yellowstone raw WAL utility
 
 Usage:
   corectl capture [flags]     Capture Yellowstone updates into a durable WAL
+  corectl probe [flags]       Sample provider RPCs/filters and emit redacted JSON evidence
   corectl inspect [flags]     Summarize a closed WAL
   corectl verify [flags]      Validate a closed WAL (CRC, sequence, identity, protobuf)
   corectl replay [flags]      Export WAL records as NDJSON in source append order
@@ -39,6 +40,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return nil
 	case "capture":
 		return capture(args[1:], stdout, stderr)
+	case "probe":
+		return probe(args[1:], stdout, stderr)
 	case "inspect", "verify", "replay", "migrate":
 		return offline(args[0], args[1:], stdout, stderr)
 	default:
