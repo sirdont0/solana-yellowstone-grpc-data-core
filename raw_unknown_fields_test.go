@@ -69,3 +69,83 @@ func TestRawWALPreservesUnknownProtobufFields(t *testing.T) {
 		})
 	}
 }
+
+func TestRawWALPreservesAlpenglowCertificatesAcrossFormats(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		for _, legacy := range []bool{false, true} {
+			name := map[int]string{1: "v1", 2: "v2"}[version]
+			if legacy {
+				name += "-legacy"
+			} else {
+				name += "-typed"
+			}
+			t.Run(name, func(t *testing.T) {
+				cfg := configForTest(t)
+				cfg.WALVersion = version
+				if version == 2 {
+					cfg.WALSegmentBytes = 128 << 20
+				}
+				e, err := NewRaw(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				footer := &pb.SubscribeUpdateBlockFooter{Slot: 500, BankId: 17}
+				if legacy {
+					// Old wincode-style 6/7/8 bytes are unknown in the new schema.
+					footer.ProtoReflect().SetUnknown(protowire.AppendBytes(protowire.AppendTag(nil, 6, protowire.BytesType), []byte{0xaa, 0xbb}))
+				} else {
+					footer.BlockFinalCert = &pb.BlockFooterFinalCert{
+						Slot: 499,
+						FinalAggregate: &pb.BlockFooterVotesAggregate{
+							SignatureKind: pb.BlockFooterSignatureKind_COMPRESSED_BLS12_381_G2,
+							BlockId:       []byte{0x11, 0x22},
+						},
+					}
+				}
+				update := &pb.SubscribeUpdate{UpdateOneof: &pb.SubscribeUpdate_BlockFooter{BlockFooter: footer}}
+				lcfg := toLabConfig(e.cfg, e.cfg.Sources[0])
+				store, err := lab.OpenStore(lcfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rec, err := lab.FromUpdate(lcfg, "a", 1, update)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if accepted, err := store.Append(rec); err != nil || !accepted {
+					t.Fatalf("append accepted=%v err=%v", accepted, err)
+				}
+				if err := store.Close(); err != nil {
+					t.Fatal(err)
+				}
+				e.stores["a"] = store
+				found := false
+				if err := e.ReadRaw(context.Background(), "a", RawCursor{}, func(ob RawObservation) error {
+					if ob.Type != "update" {
+						return nil
+					}
+					found = true
+					if ob.Kind != "block_footer" || ob.Slot != 500 {
+						t.Fatalf("unexpected footer envelope kind=%q slot=%d", ob.Kind, ob.Slot)
+					}
+					var got pb.SubscribeUpdate
+					if err := proto.Unmarshal(ob.Payload, &got); err != nil {
+						return err
+					}
+					if !proto.Equal(&got, update) {
+						t.Fatal("Alpenglow footer changed across raw WAL round-trip")
+					}
+					if !legacy && got.GetBlockFooter().GetBlockFinalCert().GetSlot() != 499 {
+						t.Fatal("certificate's own slot was lost")
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if !found {
+					t.Fatal("Alpenglow footer not found in raw replay")
+				}
+			})
+		}
+	}
+}
