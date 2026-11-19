@@ -33,6 +33,7 @@ type WAL struct {
 	journalID     string
 	v2            *segmentedWAL
 	writeFrame    func([]byte) (int, error)
+	syncFrame     func() error
 	indexReady    bool
 	records       uint64
 	offset        int64
@@ -300,7 +301,11 @@ func (w *WAL) AppendBatch(records []Record) (err error) {
 		}
 	}
 	syncStarted := time.Now()
-	syncErr := w.f.Sync()
+	sync := w.syncFrame
+	if sync == nil {
+		sync = w.f.Sync
+	}
+	syncErr := sync()
 	syncDuration := time.Since(syncStarted)
 	w.lastSync = syncDuration
 	w.totalSync += syncDuration

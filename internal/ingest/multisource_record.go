@@ -15,11 +15,15 @@ func (c *MultiSourceCoordinator) ObserveRecord(r Record) (MultiSourceDecision, e
 			result := MultiSourceDecision{}
 			for _, id := range c.order {
 				s := c.sources[id]
+				c.markOpenPartial(s, &result)
 				if s.health.Connected || s.pendingAttempt {
 					s.health.Connected = false
 					s.pendingAttempt = false
 					result.Processed = true
 				}
+			}
+			if len(result.Issues) > 0 {
+				result.Processed = true
 			}
 			result.Quality = c.quality()
 			return result, nil
@@ -78,6 +82,12 @@ func (c *MultiSourceCoordinator) ObserveWALRecord(walSource string, r Record) (M
 	}
 	switch r.Kind {
 	case "session_end":
+		// A graceful local writer close is not a bank-complete witness.
+		// Preserve the uncertainty for every open bank owned by this WAL.
+		c.markOpenPartial(s, &result)
+		if len(result.Issues) > 0 {
+			result.Processed = true
+		}
 		if s.health.Connected || s.pendingAttempt {
 			s.health.Connected = false
 			s.pendingAttempt = false

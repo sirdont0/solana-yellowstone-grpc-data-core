@@ -792,7 +792,19 @@ func (e *Engine) consumerCursorPath(consumer, source string) string {
 	return filepath.Join(e.cfg.DataDir, source, "consumers", consumer+".json")
 }
 
+type cursorAtomicHooks struct {
+	syncTemp func(*os.File) error
+	rename   func(string, string) error
+	syncDir  func(string) error
+}
+
 func writeCursorAtomic(path string, cursor RawCursor) error {
+	return writeCursorAtomicWithHooks(path, cursor, cursorAtomicHooks{})
+}
+
+// writeCursorAtomicWithHooks exposes the three commit boundaries to deterministic
+// fault tests. Production calls use the real fsync/rename/directory fsync.
+func writeCursorAtomicWithHooks(path string, cursor RawCursor, hooks cursorAtomicHooks) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
@@ -811,7 +823,11 @@ func writeCursorAtomic(path string, cursor RawCursor) error {
 		_, err = f.Write(b)
 	}
 	if err == nil {
-		err = f.Sync()
+		if hooks.syncTemp != nil {
+			err = hooks.syncTemp(f)
+		} else {
+			err = f.Sync()
+		}
 	}
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
@@ -819,8 +835,16 @@ func writeCursorAtomic(path string, cursor RawCursor) error {
 	if err != nil {
 		return err
 	}
-	if err = os.Rename(tmp, path); err != nil {
+	if hooks.rename != nil {
+		err = hooks.rename(tmp, path)
+	} else {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
 		return err
+	}
+	if hooks.syncDir != nil {
+		return hooks.syncDir(dir)
 	}
 	return syncConsumerCursorDir(dir)
 }
