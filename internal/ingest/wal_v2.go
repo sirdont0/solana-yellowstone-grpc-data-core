@@ -17,6 +17,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	pb "github.com/sirdont0/solana-yellowstone-grpc-data-core/proto"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 )
 
 var (
@@ -26,20 +30,33 @@ var (
 )
 
 const (
-	walV2Version             = 2
-	walV2DefaultSegmentBytes = int64(256 << 20)
-	walV2MaxHeaderBytes      = 1 << 20
-	walV2FramePrefixBytes    = 16
-	walV2FooterBytes         = 8 + 5*8 + sha256.Size + 4
+	walV2Version = 2
+	// walV2EnvelopeSchemaVersion versions the JSON metadata contract independently
+	// from the physical segment format. The physical framing remains version 2.
+	walV2EnvelopeSchemaVersion   = 1
+	walV2DefaultSegmentBytes     = int64(256 << 20)
+	walV2MaxHeaderBytes          = 1 << 20
+	walV2FramePrefixBytes        = 16
+	walV2FooterBytes             = 8 + 5*8 + sha256.Size + 4
+	walV2GeyserDescriptorSHA256  = "20146a8e752395fa29404cb7577b1455626aa6f99ddab8d663f56fc380e43f4d"
+	walV2StorageDescriptorSHA256 = "fb8563bc72daf6d1996ae5b00e5315dece42619b407ab1160f21aa364d110ec5"
+	// Legacy pins are intentionally separate from the current pins. If the
+	// reviewed descriptors ever change, old unbound journals must fail closed
+	// instead of being silently attributed to the new descriptors.
+	walV2LegacyGeyserDescriptorSHA256  = "20146a8e752395fa29404cb7577b1455626aa6f99ddab8d663f56fc380e43f4d"
+	walV2LegacyStorageDescriptorSHA256 = "fb8563bc72daf6d1996ae5b00e5315dece42619b407ab1160f21aa364d110ec5"
 )
 
 type walV2Header struct {
-	Version       int    `json:"version"`
-	Segment       uint64 `json:"segment"`
-	Source        string `json:"source"`
-	Identity      string `json:"identity"`
-	JournalID     string `json:"journal_id"`
-	FirstSequence uint64 `json:"first_sequence"`
+	Version                 int    `json:"version"`
+	Segment                 uint64 `json:"segment"`
+	Source                  string `json:"source"`
+	Identity                string `json:"identity"`
+	JournalID               string `json:"journal_id"`
+	FirstSequence           uint64 `json:"first_sequence"`
+	EnvelopeSchemaVersion   int    `json:"envelope_schema_version,omitempty"`
+	GeyserDescriptorSHA256  string `json:"geyser_descriptor_sha256,omitempty"`
+	StorageDescriptorSHA256 string `json:"storage_descriptor_sha256,omitempty"`
 }
 
 type walV2SegmentMeta struct {
@@ -61,14 +78,17 @@ type walV2ActiveMeta struct {
 }
 
 type walV2Manifest struct {
-	Version    int                `json:"version"`
-	Generation uint64             `json:"generation"`
-	Source     string             `json:"source"`
-	Identity   string             `json:"identity"`
-	JournalID  string             `json:"journal_id"`
-	Sealed     []walV2SegmentMeta `json:"sealed,omitempty"`
-	Active     walV2ActiveMeta    `json:"active"`
-	Checksum   string             `json:"checksum"`
+	Version                 int                `json:"version"`
+	Generation              uint64             `json:"generation"`
+	Source                  string             `json:"source"`
+	Identity                string             `json:"identity"`
+	JournalID               string             `json:"journal_id"`
+	EnvelopeSchemaVersion   int                `json:"envelope_schema_version,omitempty"`
+	GeyserDescriptorSHA256  string             `json:"geyser_descriptor_sha256,omitempty"`
+	StorageDescriptorSHA256 string             `json:"storage_descriptor_sha256,omitempty"`
+	Sealed                  []walV2SegmentMeta `json:"sealed,omitempty"`
+	Active                  walV2ActiveMeta    `json:"active"`
+	Checksum                string             `json:"checksum"`
 }
 
 type walV2Footer struct {
@@ -116,6 +136,75 @@ type segmentedWALReader struct {
 	sealed []walV2Segment
 	active walV2Segment
 	last   uint64
+}
+
+// walV2CurrentDescriptorBinding verifies that the generated descriptors in
+// this binary still match the reviewed schema pins. Journals bind both files
+// because Record.Raw contains Geyser messages and downstream storage decoding
+// uses the storage descriptor as part of the same ingestion contract.
+func walV2CurrentDescriptorBinding() (string, string, error) {
+	walV2DescriptorBindingOnce.Do(func() {
+		geyserBytes, err := (proto.MarshalOptions{Deterministic: true}).Marshal(protodesc.ToFileDescriptorProto(pb.File_solanacore_geyser_proto))
+		if err != nil {
+			walV2DescriptorBindingErr = fmt.Errorf("WAL v2 marshal local Geyser descriptor: %w", err)
+			return
+		}
+		storageBytes, err := (proto.MarshalOptions{Deterministic: true}).Marshal(protodesc.ToFileDescriptorProto(pb.File_solanacore_storage_proto))
+		if err != nil {
+			walV2DescriptorBindingErr = fmt.Errorf("WAL v2 marshal local storage descriptor: %w", err)
+			return
+		}
+		geyserDigest := fmt.Sprintf("%x", sha256.Sum256(geyserBytes))
+		storageDigest := fmt.Sprintf("%x", sha256.Sum256(storageBytes))
+		if geyserDigest != walV2GeyserDescriptorSHA256 || storageDigest != walV2StorageDescriptorSHA256 {
+			walV2DescriptorBindingErr = fmt.Errorf("WAL v2 local protobuf descriptors differ from reviewed pins: geyser=%s storage=%s", geyserDigest, storageDigest)
+			return
+		}
+		walV2DescriptorBindingGeyser = geyserDigest
+		walV2DescriptorBindingStorage = storageDigest
+	})
+	return walV2DescriptorBindingGeyser, walV2DescriptorBindingStorage, walV2DescriptorBindingErr
+}
+
+var (
+	walV2DescriptorBindingOnce    sync.Once
+	walV2DescriptorBindingGeyser  string
+	walV2DescriptorBindingStorage string
+	walV2DescriptorBindingErr     error
+)
+
+func normalizeWALV2Envelope(schemaVersion *int, geyserDigest, storageDigest *string) error {
+	// Pre-freeze v2 journals had no explicit envelope marker. Their bytes were
+	// written by this repository's pinned descriptors, so the all-absent form
+	// maps to the sole supported schema. A partial binding is ambiguous and is
+	// rejected rather than guessed.
+	if *schemaVersion == 0 && *geyserDigest == "" && *storageDigest == "" {
+		*schemaVersion = walV2EnvelopeSchemaVersion
+		*geyserDigest = walV2LegacyGeyserDescriptorSHA256
+		*storageDigest = walV2LegacyStorageDescriptorSHA256
+	}
+	if *schemaVersion != walV2EnvelopeSchemaVersion {
+		return fmt.Errorf("unsupported WAL v2 envelope schema version %d", *schemaVersion)
+	}
+	if *geyserDigest == "" || *storageDigest == "" {
+		return errors.New("WAL v2 envelope descriptor binding is incomplete")
+	}
+	localGeyser, localStorage, err := walV2CurrentDescriptorBinding()
+	if err != nil {
+		return err
+	}
+	if *geyserDigest != localGeyser || *storageDigest != localStorage {
+		return fmt.Errorf("WAL v2 protobuf descriptor mismatch: journal geyser=%s storage=%s, local geyser=%s storage=%s", *geyserDigest, *storageDigest, localGeyser, localStorage)
+	}
+	return nil
+}
+
+func normalizeWALV2HeaderEnvelope(header *walV2Header) error {
+	return normalizeWALV2Envelope(&header.EnvelopeSchemaVersion, &header.GeyserDescriptorSHA256, &header.StorageDescriptorSHA256)
+}
+
+func normalizeWALV2ManifestEnvelope(manifest *walV2Manifest) error {
+	return normalizeWALV2Envelope(&manifest.EnvelopeSchemaVersion, &manifest.GeyserDescriptorSHA256, &manifest.StorageDescriptorSHA256)
 }
 
 // OpenWALV2 opens an opt-in segmented journal. Version 1 remains readable via
@@ -187,6 +276,9 @@ func (w *segmentedWAL) open(source, identity string, visit func(Record) error) e
 			return err
 		}
 		header := walV2Header{Version: walV2Version, Segment: 1, Source: source, Identity: identity, JournalID: journalID, FirstSequence: 1}
+		if err := normalizeWALV2HeaderEnvelope(&header); err != nil {
+			return err
+		}
 		headerBytes, err := encodeWALV2Header(header)
 		if err != nil {
 			return err
@@ -213,6 +305,7 @@ func (w *segmentedWAL) open(source, identity string, visit func(Record) error) e
 		w.activeHeaderLen = int64(len(headerBytes))
 		w.manifest = walV2Manifest{
 			Version: walV2Version, Generation: 1, Source: source, Identity: identity, JournalID: journalID,
+			EnvelopeSchemaVersion: header.EnvelopeSchemaVersion, GeyserDescriptorSHA256: header.GeyserDescriptorSHA256, StorageDescriptorSHA256: header.StorageDescriptorSHA256,
 			Active: walV2ActiveMeta{ID: 1, FirstSequence: 1, CommittedBytes: int64(len(headerBytes))},
 		}
 		return w.persistManifest(w.manifest)
@@ -322,7 +415,14 @@ func (w *segmentedWAL) recoverActive() error {
 			return err
 		}
 		if int64(len(headerBytes)) != active.CommittedBytes {
-			return errors.New("WAL v2 active manifest header size mismatch")
+			legacyBytes, legacyErr := encodeWALV2LegacyHeader(header)
+			if legacyErr != nil {
+				return legacyErr
+			}
+			if int64(len(legacyBytes)) != active.CommittedBytes {
+				return errors.New("WAL v2 active manifest header size mismatch")
+			}
+			headerBytes = legacyBytes
 		}
 		return w.createActive(header, headerBytes)
 	}
@@ -341,8 +441,16 @@ func (w *segmentedWAL) recoverActive() error {
 			return encodeErr
 		}
 		if active.CommittedBytes != int64(len(expectedBytes)) {
-			_ = f.Close()
-			return errors.New("WAL v2 empty active manifest header size mismatch")
+			legacyBytes, legacyErr := encodeWALV2LegacyHeader(expectedHeader)
+			if legacyErr != nil {
+				_ = f.Close()
+				return legacyErr
+			}
+			if active.CommittedBytes != int64(len(legacyBytes)) {
+				_ = f.Close()
+				return errors.New("WAL v2 empty active manifest header size mismatch")
+			}
+			expectedBytes = legacyBytes
 		}
 		stat, statErr := f.Stat()
 		if statErr != nil {
@@ -427,6 +535,9 @@ func (w *segmentedWAL) recoverActive() error {
 }
 
 func (w *segmentedWAL) createActive(header walV2Header, headerBytes []byte) error {
+	if err := normalizeWALV2HeaderEnvelope(&header); err != nil {
+		return err
+	}
 	path := walV2SegmentPath(w.dir, header.Segment, false)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if err != nil {
@@ -510,6 +621,9 @@ func (w *segmentedWAL) validateAndVisit(visit func(Record) error) error {
 var ErrWALV2CommitUncertain = errors.New("WAL v2 commit outcome is uncertain; reopen the journal before retry")
 
 func (w *segmentedWAL) persistManifest(manifest walV2Manifest) error {
+	if err := normalizeWALV2ManifestEnvelope(&manifest); err != nil {
+		return err
+	}
 	if w.manifestWriter != nil {
 		return w.manifestWriter(w.dir, manifest)
 	}
@@ -1174,7 +1288,7 @@ func decodeWALV2Frame(body []byte) (Record, error) {
 		return Record{}, errors.New("WAL v2 raw payload length is invalid")
 	}
 	var record Record
-	if err := json.Unmarshal(body[12:metadataEnd], &record); err != nil {
+	if err := decodeWALV2JSON(body[12:metadataEnd], &record); err != nil {
 		return Record{}, fmt.Errorf("WAL v2 record metadata: %w", err)
 	}
 	if record.Sequence != sequence || sequence == 0 {
@@ -1184,11 +1298,56 @@ func decodeWALV2Frame(body []byte) (Record, error) {
 	return record, nil
 }
 
+func decodeWALV2JSON(encoded []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
 func encodeWALV2Header(header walV2Header) ([]byte, error) {
+	if err := normalizeWALV2HeaderEnvelope(&header); err != nil {
+		return nil, err
+	}
 	metadata, err := json.Marshal(header)
 	if err != nil {
 		return nil, err
 	}
+	return encodeWALV2HeaderMetadata(metadata)
+}
+
+// encodeWALV2LegacyHeader reproduces the pre-freeze v2 header exactly. It is
+// used only to repair a legacy empty active header whose manifest committed
+// offset records the old, shorter header length.
+func encodeWALV2LegacyHeader(header walV2Header) ([]byte, error) {
+	legacy := struct {
+		Version       int    `json:"version"`
+		Segment       uint64 `json:"segment"`
+		Source        string `json:"source"`
+		Identity      string `json:"identity"`
+		JournalID     string `json:"journal_id"`
+		FirstSequence uint64 `json:"first_sequence"`
+	}{
+		Version: header.Version, Segment: header.Segment, Source: header.Source, Identity: header.Identity,
+		JournalID: header.JournalID, FirstSequence: header.FirstSequence,
+	}
+	metadata, err := json.Marshal(legacy)
+	if err != nil {
+		return nil, err
+	}
+	return encodeWALV2HeaderMetadata(metadata)
+}
+
+func encodeWALV2HeaderMetadata(metadata []byte) ([]byte, error) {
 	if len(metadata) == 0 || len(metadata) > walV2MaxHeaderBytes {
 		return nil, errors.New("WAL v2 segment header metadata size is invalid")
 	}
@@ -1206,8 +1365,12 @@ func readWALV2Header(file *os.File) (walV2Header, int64, error) {
 	if _, err := file.ReadAt(prefix[:], 0); err != nil {
 		return walV2Header{}, 0, err
 	}
-	if string(prefix[:8]) != string(walV2SegmentMagic) || binary.LittleEndian.Uint16(prefix[8:10]) != walV2Version {
-		return walV2Header{}, 0, errors.New("wrong WAL v2 segment header")
+	if string(prefix[:8]) != string(walV2SegmentMagic) {
+		return walV2Header{}, 0, errors.New("wrong WAL v2 segment header magic")
+	}
+	physicalVersion := binary.LittleEndian.Uint16(prefix[8:10])
+	if physicalVersion != walV2Version {
+		return walV2Header{}, 0, fmt.Errorf("unsupported WAL v2 segment format version %d", physicalVersion)
 	}
 	length := binary.LittleEndian.Uint32(prefix[10:14])
 	if length == 0 || length > walV2MaxHeaderBytes {
@@ -1225,18 +1388,32 @@ func readWALV2Header(file *os.File) (walV2Header, int64, error) {
 		return walV2Header{}, 0, errors.New("WAL v2 segment header CRC32C mismatch")
 	}
 	var header walV2Header
-	if err := json.Unmarshal(metadata, &header); err != nil {
+	if err := decodeWALV2JSON(metadata, &header); err != nil {
 		return walV2Header{}, 0, err
 	}
-	if header.Version != walV2Version || header.Segment == 0 || header.FirstSequence == 0 || header.Identity == "" || header.JournalID == "" {
+	if header.Version != walV2Version {
+		return walV2Header{}, 0, fmt.Errorf("unsupported WAL v2 JSON header version %d", header.Version)
+	}
+	if header.Segment == 0 || header.FirstSequence == 0 || header.Identity == "" || header.JournalID == "" {
 		return walV2Header{}, 0, errors.New("WAL v2 segment header fields are invalid")
+	}
+	if err := normalizeWALV2HeaderEnvelope(&header); err != nil {
+		return walV2Header{}, 0, err
 	}
 	return header, int64(14 + length + 4), nil
 }
 
 func validateWALV2Header(header walV2Header, manifest walV2Manifest, segment, firstSequence uint64) error {
+	if err := normalizeWALV2HeaderEnvelope(&header); err != nil {
+		return err
+	}
+	if err := normalizeWALV2ManifestEnvelope(&manifest); err != nil {
+		return err
+	}
 	if header.Version != walV2Version || header.Segment != segment || header.FirstSequence != firstSequence ||
-		header.Source != manifest.Source || header.Identity != manifest.Identity || header.JournalID != manifest.JournalID {
+		header.Source != manifest.Source || header.Identity != manifest.Identity || header.JournalID != manifest.JournalID ||
+		header.EnvelopeSchemaVersion != manifest.EnvelopeSchemaVersion || header.GeyserDescriptorSHA256 != manifest.GeyserDescriptorSHA256 ||
+		header.StorageDescriptorSHA256 != manifest.StorageDescriptorSHA256 {
 		return errors.New("WAL v2 segment header differs from manifest identity")
 	}
 	return nil
@@ -1429,7 +1606,7 @@ func readWALV2ManifestGeneration(dir string, generation uint64) (walV2Manifest, 
 		return walV2Manifest{}, err
 	}
 	var manifest walV2Manifest
-	if err := json.Unmarshal(encoded, &manifest); err != nil {
+	if err := decodeWALV2JSON(encoded, &manifest); err != nil {
 		return walV2Manifest{}, fmt.Errorf("WAL v2 manifest decode: %w", err)
 	}
 	checksum := manifest.Checksum
@@ -1439,10 +1616,19 @@ func readWALV2ManifestGeneration(dir string, generation uint64) (walV2Manifest, 
 		return walV2Manifest{}, err
 	}
 	digest := sha256.Sum256(canonical)
-	if checksum != hex.EncodeToString(digest[:]) || manifest.Version != walV2Version || manifest.Generation != generation || manifest.JournalID == "" || manifest.Identity == "" {
-		return walV2Manifest{}, errors.New("WAL v2 manifest checksum or identity is invalid")
+	if checksum != hex.EncodeToString(digest[:]) {
+		return walV2Manifest{}, errors.New("WAL v2 manifest checksum is invalid")
+	}
+	if manifest.Version != walV2Version {
+		return walV2Manifest{}, fmt.Errorf("unsupported WAL v2 manifest version %d", manifest.Version)
+	}
+	if manifest.Generation != generation || manifest.JournalID == "" || manifest.Identity == "" {
+		return walV2Manifest{}, errors.New("WAL v2 manifest identity or generation is invalid")
 	}
 	manifest.Checksum = checksum
+	if err := normalizeWALV2ManifestEnvelope(&manifest); err != nil {
+		return walV2Manifest{}, err
+	}
 	if err := validateWALV2Manifest(manifest); err != nil {
 		return walV2Manifest{}, err
 	}
@@ -1499,6 +1685,7 @@ func recoverWALV2BootstrapWithoutCurrent(dir, source, identity string) (walV2Man
 	}
 	manifest := walV2Manifest{
 		Version: walV2Version, Generation: 1, Source: source, Identity: identity, JournalID: header.JournalID,
+		EnvelopeSchemaVersion: header.EnvelopeSchemaVersion, GeyserDescriptorSHA256: header.GeyserDescriptorSHA256, StorageDescriptorSHA256: header.StorageDescriptorSHA256,
 		Active: walV2ActiveMeta{ID: 1, FirstSequence: 1, CommittedBytes: headerBytes},
 	}
 	manifestEntries, err := os.ReadDir(filepath.Join(dir, "manifests"))
@@ -1526,6 +1713,7 @@ func recoverWALV2BootstrapWithoutCurrent(dir, source, identity string) (walV2Man
 			return walV2Manifest{}, false, fmt.Errorf("WAL v2 bootstrap manifest: %w", err)
 		}
 		if existing.Source != manifest.Source || existing.Identity != manifest.Identity || existing.JournalID != manifest.JournalID ||
+			existing.EnvelopeSchemaVersion != manifest.EnvelopeSchemaVersion || existing.GeyserDescriptorSHA256 != manifest.GeyserDescriptorSHA256 || existing.StorageDescriptorSHA256 != manifest.StorageDescriptorSHA256 ||
 			existing.Active != manifest.Active || len(existing.Sealed) != 0 {
 			return walV2Manifest{}, false, errors.New("WAL v2 bootstrap manifest differs from segment header")
 		}
@@ -1534,6 +1722,9 @@ func recoverWALV2BootstrapWithoutCurrent(dir, source, identity string) (walV2Man
 }
 
 func validateWALV2Manifest(manifest walV2Manifest) error {
+	if err := normalizeWALV2ManifestEnvelope(&manifest); err != nil {
+		return err
+	}
 	sequence, segmentID := uint64(1), uint64(1)
 	for _, meta := range manifest.Sealed {
 		if meta.ID != segmentID || meta.File != walV2SegmentFileName(meta.ID, true) || meta.FirstSequence != sequence || meta.Records == 0 || meta.LastSequence < meta.FirstSequence || meta.LastSequence-meta.FirstSequence+1 != meta.Records || meta.DataBytes <= 0 || len(meta.Digest) != sha256.Size*2 {
@@ -1557,6 +1748,9 @@ func validateWALV2Manifest(manifest walV2Manifest) error {
 }
 
 func writeWALV2Manifest(dir string, manifest walV2Manifest) error {
+	if err := normalizeWALV2ManifestEnvelope(&manifest); err != nil {
+		return err
+	}
 	manifest.Checksum = ""
 	canonical, err := json.Marshal(manifest)
 	if err != nil {

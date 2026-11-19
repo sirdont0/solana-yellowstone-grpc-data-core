@@ -1,0 +1,60 @@
+{
+  "auth_configured": true,
+  "commitment": "finalized",
+  "core_revision": "1d3558e",
+  "dial": {
+    "status": "PASS"
+  },
+  "endpoint_sha256": "398be466723470bd9448e7ac3ceb38ec2f3698977e233a8a256f0bea3c45cdb7",
+  "get_slot": {
+    "slot": 471424390,
+    "status": "PASS"
+  },
+  "get_version": {
+    "status": "PASS",
+    "version_length": 222,
+    "version_sha256": "0704fb44c2569ae4ea1cdcd43a14f21bc864aa8cee32db1f5611820382bd77e5"
+  },
+  "provider_id": "publicnode",
+  "sample_ms": 5000,
+  "schema_version": 1,
+  "scope": "Wire/endpoint observations only; successful RPC, matching update or replay overlap never proves canonical bank/account completeness.",
+  "started_at_utc": "2026-11-19T17:46:11.084799Z",
+  "streams": {
+    "block_footer": {
+      "first": {
+        "bank_id_present_updates": 8,
+        "certificate_slot_differs": 16,
+        "elapsed_ms": 1843,
+        "first_observed_slot": 471424393,
+        "footer_with_certificates": 8,
+        "last_observed_slot": 471424400,
+        "observed_kinds": {
+          "block_footer": 8
+        },
+        "observed_updates": 8,
+        "request_sha256": "66b2e3de91b1d96ce3be10dc8dac52fc525cc90dc2b646499e1a8b20a219bd7f",
+        "status": "PASS",
+        "unknown_field_bearing_updates": 0
+      },
+      "reopen_overlap": {
+        "bank_id_present_updates": 0,
+        "certificate_slot_differs": 0,
+        "elapsed_ms": 84,
+        "footer_with_certificates": 0,
+        "grpc_code": "Unavailable",
+        "observed_kinds": {},
+        "observed_updates": 0,
+        "request_sha256": "52f369b58e63b2caf5ba936d8f402c96f1aaefcec636b92f87f244b72fc9d120",
+        "requested_from_slot": 471424393,
+        "status": "FAIL",
+        "unknown_field_bearing_updates": 0
+      }
+    }
+  },
+  "subscribe_replay_info": {
+    "first_available": 471423900,
+    "status": "PASS"
+  },
+  "token_header": "x-token"
+}

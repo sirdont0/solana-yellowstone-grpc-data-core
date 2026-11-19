@@ -113,20 +113,8 @@ func OpenStore(c Config) (*Store, error) { return OpenStoreObserved(c, nil) }
 // creating a new journal. The two formats carry independent journal IDs and
 // consumer cursors; selecting the other one would silently hide history.
 func checkExistingWALFormat(c Config) error {
-	conflicting := filepath.Join(c.DataDir, "journal.v2")
-	previous, requested := "v2", "v1"
-	if c.WALVersion == 2 {
-		conflicting = filepath.Join(c.DataDir, "journal.wal")
-		previous, requested = "v1", "v2"
-	}
-	_, err := os.Lstat(conflicting)
-	if err == nil {
-		return fmt.Errorf("WAL format mismatch: existing %s journal at %s; requested %s. Reopen with the original WALVersion or explicitly migrate history into a new DataDir", previous, conflicting, requested)
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("check existing WAL format at %s: %w", conflicting, err)
-	}
-	return nil
+	_, _, _, err := inspectWALFormat(c)
+	return err
 }
 
 // OpenStoreObserved observes existing WAL records and subsequent durable writes
@@ -158,7 +146,8 @@ func OpenStoreObserved(c Config, observer func(Record) error) (*Store, error) {
 }
 
 func openStoreObservedLocked(c Config, observer func(Record) error) (*Store, error) {
-	if err := checkExistingWALFormat(c); err != nil {
+	formatMarker, markerExists, journalExists, err := inspectWALFormat(c)
+	if err != nil {
 		return nil, err
 	}
 	s := &Store{onDurable: observer, cfg: c, dir: c.DataDir, dedupe: make(map[string]string), changed: make(chan struct{}), cp: Checkpoint{Schema: 1, Identity: c.Identity(), FilterVersion: c.FilterVersion, Commitment: c.Commitment, Quality: "OBSERVING_UNVERIFIED", Sources: make(map[string]*SourceState)}}
@@ -287,6 +276,10 @@ func openStoreObservedLocked(c Config, observer func(Record) error) (*Store, err
 		}
 	}
 	s.cp.JournalID = s.journalID
+	if markerExists && s.journalID != formatMarker.JournalID {
+		_ = s.Abort()
+		return nil, fmt.Errorf("WAL format marker journal ID mismatch: marker=%s opened=%s; refusing to append to a replacement journal", formatMarker.JournalID, s.journalID)
+	}
 	if previousIdentity != "" && previousIdentity != c.Identity() {
 		_ = w.Close()
 		_ = s.diskDedupe.close()
@@ -313,6 +306,21 @@ func openStoreObservedLocked(c Config, observer func(Record) error) (*Store, err
 	if e = s.Mark("", 0, "session_start", "new process session"); e != nil {
 		s.Close()
 		return nil, e
+	}
+	if !markerExists {
+		// An existing markerless journal is adopted only after OpenWAL replay
+		// (including frame and subscription-identity checks) has succeeded.
+		// A brand-new journal reaches this point only after session_start has
+		// been durably appended, so its marker never advertises an empty WAL.
+		marker := newWALFormatMarker(c.WALVersion, c.SourceID, c.Identity(), s.journalID)
+		if err := writeWALFormatMarker(c.DataDir, marker); err != nil {
+			kind := "new"
+			if journalExists {
+				kind = "legacy"
+			}
+			abortErr := s.Abort()
+			return nil, errors.Join(fmt.Errorf("persist %s WAL format marker: %w", kind, err), abortErr)
+		}
 	}
 	return s, nil
 }

@@ -1,6 +1,6 @@
 # Solana Yellowstone gRPC Data Core — Русский
 
-[← Главная](../README.md) · [🇬🇧 English](README.en.md) · [🇷🇺 Русский](README.ru.md) · [Архитектура](ARCHITECTURE.md) · [План Aggregator V2](AGGREGATOR_V2_ROADMAP.ru.md) · [Технический долг](TECH_DEBT.md) · [Участие](../CONTRIBUTING.md) · [Безопасность](../SECURITY.md)
+[← Главная](../README.md) · [🇬🇧 English](README.en.md) · [🇷🇺 Русский](README.ru.md) · [Архитектура](ARCHITECTURE.md) · [Спецификации Core](PROJECT_SCOPE.md) · [Приёмка и SLO](CONSUMER_ACCEPTANCE_AND_SLO.md) · [План Core](ROADMAP.md) · [План Aggregator V2](AGGREGATOR_V2_ROADMAP.ru.md) · [Технический долг](TECH_DEBT.md) · [Участие](../CONTRIBUTING.md) · [Безопасность](../SECURITY.md)
 
 ## Обзор
 
@@ -11,6 +11,8 @@ Solana Yellowstone gRPC Data Core — встраиваемая Go-библиот
 **Чего в ядре нет:** подсчёта холдеров, расчёта цен и ликвидности, отправки торговых операций, ML-признаков и автоматического RPC/SQD-восстановления. Эти функции остаются на прикладном уровне Aggregator V2 и других приложений.
 
 **Статус:** экспериментальная версия v0. Даже при finalized события остаются наблюдениями; ядро пока не доказывает полноту банков и истории аккаунтов/конфигурации. У событий качество OBSERVING_UNVERIFIED либо CONTINUITY_BROKEN.
+
+**Согласованные контракты от 19 ноября 2026:** [цели и четыре ADR](PROJECT_SCOPE.md), [source/raw consumer API](SOURCE_CONTRACT.md), [проверка провайдеров](PROVIDER_MATRIX.md), [ожидания downstream, тесты и SLO](CONSUMER_ACCEPTANCE_AND_SLO.md), [этапы/задачи](ROADMAP.md), [release gates](RELEASE_GATES.md), [исходники и лицензии](REFERENCES.md). Численные SLO являются проектными ориентирами до реальных нагрузочных тестов.
 
 ## Быстрый старт
 

@@ -1,5 +1,7 @@
 # Deferred technical debt and release gates
 
+> **Work tracking (2026-11-19):** This file retains detailed historical findings. The normalized task registry and dependencies are in [ROADMAP.md](ROADMAP.md); actual release conditions are in [RELEASE_GATES.md](RELEASE_GATES.md). Raw consumer expectations and measurable SLOs are in [CONSUMER_ACCEPTANCE_AND_SLO.md](CONSUMER_ACCEPTANCE_AND_SLO.md). Historical audit statuses below are not retrospectively upgraded.
+
 Current verification and the ordered public-Core closure checklist:
 [2026-11-17 audit](AUDIT_VERIFICATION_2026-11-17.md). It includes additional
 recovery/cursor repairs, six process-kill scenarios, an idempotent application

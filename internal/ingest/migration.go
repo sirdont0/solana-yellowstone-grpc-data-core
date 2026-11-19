@@ -220,6 +220,12 @@ func MigrateWALV1ToV2(ctx context.Context, sourceWAL, destinationRoot, source, e
 	if destCount != count || !equalSHA256(srcHash, dstHash) {
 		return result, fmt.Errorf("migration verification mismatch: source=%d target=%d", count, destCount)
 	}
+	// The format marker is part of the published source directory. Publish it
+	// only after the copied v2 journal has been fully replay-verified, and make
+	// it durable before the directory itself becomes visible at the target.
+	if err := writeWALFormatMarker(staging, newWALFormatMarker(2, source, identity, newJournalID)); err != nil {
+		return result, fmt.Errorf("write migrated WAL format marker: %w", err)
+	}
 	if _, err := os.Lstat(target); err == nil {
 		return result, fmt.Errorf("migration destination appeared during copy: %s", target)
 	} else if !errors.Is(err, os.ErrNotExist) {

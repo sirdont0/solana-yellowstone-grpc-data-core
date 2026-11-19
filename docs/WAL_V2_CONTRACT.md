@@ -1,15 +1,66 @@
 # WAL v2: design contract and acceptance gates
 
-Status: **experimental implementation; acceptance incomplete** (2026-11-17).
+> **Decision and gate:** [ADR-0003](ADR/0003-wal-policy.md) retains WAL v1 as the default while v2 is experimental. [RELEASE_GATES.md](RELEASE_GATES.md) defines evidence required to change that status. Current layout below is `journal.v2/`; prospective improvements are requirements, not implemented facts.
+
+Status: **experimental implementation; acceptance incomplete** (2026-11-19).
 The default remains the `YLABWAL1` single-file journal; `WALVersion=2` opts into
-the segmented writer in this working tree. The invariants below are acceptance
-requirements, not a claim that the implementation satisfies them. The
-[2026-11-16 recheck](AUDIT_FOLLOWUP_2026-11-16.md) originally reproduced five
-defects; subsequent fixes pass all five regression probes. Automatic in-place
-migration is not implemented. An explicit, verified v1-to-v2 copy into a
-separate data root is implemented. Release acceptance still requires the
-complete fault/load matrix and a review of the binary envelope and failure
-model.
+the segmented writer. Automatic in-place migration is not implemented. An
+explicit, verified v1-to-v2 copy into a separate data root is implemented.
+Release acceptance still requires incremental crash recovery, authoritative
+retention/compaction, the complete fault/load matrix and operational evidence.
+
+## Frozen v2.0 byte and schema contract
+
+The physical format is `format_version=2` (`YLABV2SG`). It is deliberately
+separate from `envelope_schema_version=1`, which versions the JSON observation
+metadata. New segment headers and manifests bind both exact deterministic
+protobuf descriptor SHA-256 values:
+
+- Geyser: `20146a8e752395fa29404cb7577b1455626aa6f99ddab8d663f56fc380e43f4d`.
+- Storage: `fb8563bc72daf6d1996ae5b00e5315dece42619b407ab1160f21aa364d110ec5`.
+
+All integer fields are little-endian. CRC uses CRC32C/Castagnoli; content hashes
+use SHA-256. JSON metadata is encoded with Go `encoding/json` for the frozen
+struct field order. The manifest checksum is SHA-256 of `json.Marshal(manifest)`
+with `Checksum` set to the empty string. `CURRENT` is the ASCII decimal
+manifest generation followed by LF and selects exactly one manifest.
+
+- **Segment header:** 8-byte `YLABV2SG`; `uint16 format_version`; `uint32
+  metadata_length`; JSON header bytes; `uint32 CRC32C(metadata)`.
+- **Frame:** `uint32 body_length`; `uint32 CRC32C(body)`; body = `uint64
+  sequence`; `uint32 metadata_length`; JSON `Record` metadata with `Raw`
+  omitted; `uint32 raw_length`; raw protobuf bytes. The body length excludes
+  the 8-byte outer frame prefix.
+- **Sealed footer:** 8-byte `YLABV2FT`; five `uint64` values (`segment`,
+  `first_sequence`, `last_sequence`, `record_count`, `data_bytes`); 32-byte
+  SHA-256 of the segment prefix `[0:data_bytes]`; `uint32 CRC32C` over the
+  preceding footer bytes. Footer interpretation is bound to format version 2.
+- **Manifest:** JSON with physical version, generation, source/identity/journal
+  IDs, envelope schema and descriptor digests, sealed segment metadata, active
+  committed prefix, and checksum. Readers reject unknown JSON fields and do
+  not fall back to older generations.
+
+Unknown fields in v2 frame metadata, segment headers, manifests and the
+persistent format marker are rejected. Unknown protobuf wire fields inside the
+raw `Raw` payload are preserved byte-for-byte. Unsupported envelope schema or
+a descriptor mismatch is rejected before any replay callback receives a
+record. Legacy experimental v2 files are normalized only if all new schema
+binding fields are absent; a partial binding is ambiguous and fails closed.
+
+Each source DataDir also contains `.wal-format.json`, binding marker schema,
+WAL version, source ID, subscription identity and journal ID. It is checksummed,
+strictly decoded and atomically published through temp-file fsync, rename and
+directory fsync. A missing journal with an existing marker fails closed instead
+of creating a new journal in another format. A markerless legacy journal is
+adopted only after a successful full replay. This does not protect against loss
+of the entire DataDir including its marker.
+
+`v2 -> v1` downgrade is unsupported. Rollback uses the untouched original v1
+DataDir retained by the separate-root migration workflow. Golden byte fixtures
+for headers, frames, active/sealed segments, manifest and CURRENT live in
+`internal/ingest/testdata/wal_v2_golden/`; the test compares writer output
+byte-for-byte and reads the immutable fixtures. The compatibility audit is
+[CORE-C3-01](audits/2026-11-19-c3/WAL_V2_COMPATIBILITY.md).
 
 ## Invariants
 
@@ -47,25 +98,26 @@ dedupe recovery remain unimplemented.
 
 ```
 data_dir/source/
-  journal.wal                   # existing v1; never modified by v2 writer
-  v2/
-    CURRENT                     # atomic manifest generation pointer
-    manifests/00000001.json    # immutable, checksummed manifests
-    segments/00000001.open     # one active segment, exclusive writer
-    segments/00000002.seg      # sealed immutable segment
-    indexes/00000002.sidx     # optional rebuildable sparse index
-    checkpoints/00000002.json # optional, WAL-bound acceleration artifact
+  .wal-format.json                    # durable format/source/identity/journal binding
+  journal.wal                         # existing v1; never modified by v2 writer
+  checkpoint.json                     # optional Store recovery cache
+  journal.v2/
+    CURRENT                           # atomic manifest generation pointer
+    manifests/manifest-000...002.json # immutable, checksummed generations
+    segments/segment-000...001.open   # one active segment, exclusive writer
+    segments/segment-000...001.seg    # sealed immutable segment
+    indexes/segment-000...001.seg.sidx # optional rebuildable sparse index
 ```
 
-The v2 segment header must include magic/version, journal ID, subscription
-identity hash, source ID, first sequence and an envelope schema/descriptor
-digest. A frame should contain a bounded length, CRC32C or stronger checksum,
-sequence and versioned binary observation envelope. The envelope must preserve
+The frozen v2 segment header includes magic/version, journal ID, subscription
+identity, source ID, first sequence and an envelope schema/descriptor digest. A
+frame contains a bounded length, CRC32C checksum, sequence and versioned
+observation envelope. The envelope must preserve
 the original raw protobuf payload *as available after gRPC decoding*, record
 kind/commitment, source generation, optional bank-ID presence, provider time and
 received time. A sealed footer commits record count, last sequence, byte length
-and content digest. Exact wire layout and protobuf descriptor are still to be
-reviewed; keep this document independent of a speculative struct layout.
+and content digest. The exact wire layout and pinned descriptor digests are normative in the
+preceding section and in the golden fixtures.
 
 Manifest entries bind segment identity, first/last sequences, sealed digest
 and schema. The active segment may be referenced with its last **fsynced**

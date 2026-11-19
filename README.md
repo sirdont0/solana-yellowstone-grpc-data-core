@@ -11,7 +11,7 @@ Multi-source Yellowstone gRPC · crash-aware WAL · transaction/CPI decoding · 
 [![License: MIT](https://img.shields.io/badge/code%20license-MIT-2ea44f)](LICENSE)
 [![Protocol: Yellowstone](https://img.shields.io/badge/protocol-Yellowstone%20gRPC-7158e2)](https://github.com/rpcpool/yellowstone-grpc)
 
-**[Get started](#quick-start)** · **[Architecture](#architecture-at-a-glance)** · **[Aggregator V2 roadmap](docs/AGGREGATOR_V2_ROADMAP.md)** · **[Documentation](#documentation)** · **[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)**
+**[Get started](#quick-start)** · **[Architecture](#architecture-at-a-glance)** · **[Core roadmap](docs/ROADMAP.md)** · **[Aggregator V2 roadmap](docs/AGGREGATOR_V2_ROADMAP.md)** · **[Documentation](#documentation)** · **[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)**
 
 [🇬🇧 English](docs/README.en.md) · [🇷🇺 Русский](docs/README.ru.md)
 
@@ -137,10 +137,14 @@ Filtered slot sequences can legitimately skip numbers. In particular, `101 → 1
 | :--- | :--- |
 | [🇬🇧 English](docs/README.en.md) · [🇷🇺 Русский](docs/README.ru.md) | Installation, configuration, API integration and examples |
 | [Architecture and invariants](docs/ARCHITECTURE.md) | End-to-end flow, evidence, delivery, boundaries and acceptance status |
+| [Core scope and accepted ADRs](docs/PROJECT_SCOPE.md) · [Source / consumer contract](docs/SOURCE_CONTRACT.md) | Agreed boundaries, four decisions, exact raw interfaces and quality semantics (RU) |
+| [Provider compatibility matrix](docs/PROVIDER_MATRIX.md) · [Consumer test and SLO contract](docs/CONSUMER_ACCEPTANCE_AND_SLO.md) | Provider-specific probes, downstream expectations, latency, recovery and fault/load acceptance (RU) |
+| [Core roadmap](docs/ROADMAP.md) · [Release gates](docs/RELEASE_GATES.md) · [References](docs/REFERENCES.md) | Task IDs, dependencies, measurable acceptance, upstream projects and limitations (RU) |
 | [Aggregator V2 Go/Rust roadmap](docs/AGGREGATOR_V2_ROADMAP.md) · [Русский](docs/AGGREGATOR_V2_ROADMAP.ru.md) | Go-first decision, language-neutral boundary, lifecycle, correctness and performance gates |
 | [Technical debt / release gates](docs/TECH_DEBT.md) | Full-bank verification, account completeness, RPC/SQD recovery and load acceptance |
 | [Audit fixes, 2026-11-15](docs/AUDIT_CLOSURE_2026-11-15.md) | Finding dispositions, regression evidence and remaining release gates |
 | [Audit follow-up, 2026-11-16](docs/AUDIT_FOLLOWUP_2026-11-16.md) | Raw subscriptions, cursors/ACK, bounded shutdown, byte budgets and remaining work |
+| [C2 / G2 integration evidence](docs/audits/2026-11-19-c2/INTEGRATION_REPORT.md) · [WAL v2 compatibility audit](docs/audits/2026-11-19-c3/WAL_V2_COMPATIBILITY.md) · [G3 provider report](docs/audits/2026-11-19-g3/REPORT.md) | Latest durability, WAL v2 schema and provider findings |
 | [Public release audit](docs/PUBLIC_RELEASE_AUDIT_2026-11-14.md) | Verified hardening and remaining release conditions |
 | [Contributing](CONTRIBUTING.md) | Local development, tests, PR conventions and decoder rules |
 | [Security policy](SECURITY.md) | Responsible disclosure, secrets and data-integrity risks |
